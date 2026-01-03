@@ -1,5 +1,5 @@
-# Cost Guardian Infrastructure
-# Deploys the Lambda-based cost monitoring and remediation system
+# AWS Cost Guardian Infrastructure
+# Simple POC account budget protection
 
 terraform {
   required_version = ">= 1.0.0"
@@ -15,40 +15,52 @@ terraform {
   }
 }
 
+# Required variables
+variable "total_budget" {
+  description = "Total POC budget in USD"
+  type        = number
+}
+
+variable "alert_email" {
+  description = "Email for budget alerts"
+  type        = string
+}
+
+# Optional variables with sensible defaults
 variable "aws_region" {
   description = "AWS region for deployment"
   type        = string
   default     = "us-east-1"
 }
 
+variable "regions" {
+  description = "AWS regions to monitor for resources"
+  type        = list(string)
+  default     = ["us-east-1"]
+}
+
+variable "alert_thresholds" {
+  description = "Budget percentage thresholds for alerts"
+  type        = list(number)
+  default     = [50, 75, 90]
+}
+
+variable "auto_stop_threshold" {
+  description = "Budget percentage to trigger auto-stop"
+  type        = number
+  default     = 100
+}
+
+variable "check_interval" {
+  description = "How often to check budget"
+  type        = string
+  default     = "rate(1 hour)"
+}
+
 variable "environment" {
   description = "Environment name"
   type        = string
-  default     = "prod"
-}
-
-variable "evaluation_schedule" {
-  description = "CloudWatch Events schedule expression for rule evaluation"
-  type        = string
-  default     = "rate(1 minute)"
-}
-
-variable "alert_email" {
-  description = "Email address for cost alerts"
-  type        = string
-  default     = ""
-}
-
-variable "default_ec2_hourly_cost" {
-  description = "Fallback hourly cost for EC2 when Pricing API fails"
-  type        = string
-  default     = "0.10"
-}
-
-variable "default_rds_hourly_cost" {
-  description = "Fallback hourly cost for RDS when Pricing API fails"
-  type        = string
-  default     = "0.15"
+  default     = "poc"
 }
 
 provider "aws" {
@@ -64,53 +76,14 @@ locals {
   }
 }
 
-# S3 bucket for configuration and Lambda code
-resource "aws_s3_bucket" "config" {
-  bucket_prefix = "cost-guardian-${var.environment}-"
-  tags          = local.tags
-}
-
-resource "aws_s3_bucket_versioning" "config" {
-  bucket = aws_s3_bucket.config.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "config" {
-  bucket = aws_s3_bucket.config.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "config" {
-  bucket                  = aws_s3_bucket.config.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# Upload rules configuration
-resource "aws_s3_object" "rules_config" {
-  bucket = aws_s3_bucket.config.id
-  key    = "cost-guardian/rules.json"
-  source = "${path.module}/rules.json"
-  etag   = filemd5("${path.module}/rules.json")
-}
-
 # SNS Topic for alerts
-resource "aws_sns_topic" "cost_alerts" {
-  name = "cost-guardian-alerts-${var.environment}"
+resource "aws_sns_topic" "alerts" {
+  name = "${local.function_name}-alerts"
   tags = local.tags
 }
 
 resource "aws_sns_topic_subscription" "email" {
-  count     = var.alert_email != "" ? 1 : 0
-  topic_arn = aws_sns_topic.cost_alerts.arn
+  topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
   endpoint  = var.alert_email
 }
@@ -118,27 +91,25 @@ resource "aws_sns_topic_subscription" "email" {
 # IAM Role for Lambda
 resource "aws_iam_role" "lambda" {
   name = "${local.function_name}-role"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
       }
-    ]
+    }]
   })
-  
+
   tags = local.tags
 }
 
 resource "aws_iam_role_policy" "lambda" {
   name = "${local.function_name}-policy"
   role = aws_iam_role.lambda.id
-  
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -153,30 +124,12 @@ resource "aws_iam_role_policy" "lambda" {
         Resource = "arn:aws:logs:*:*:*"
       },
       {
-        Sid    = "CloudWatchMetrics"
+        Sid    = "CostExplorer"
         Effect = "Allow"
         Action = [
-          "cloudwatch:GetMetricStatistics",
-          "cloudwatch:GetMetricData",
-          "cloudwatch:ListMetrics"
+          "ce:GetCostAndUsage"
         ]
         Resource = "*"
-      },
-      {
-        Sid    = "S3Config"
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject"
-        ]
-        Resource = "${aws_s3_bucket.config.arn}/*"
-      },
-      {
-        Sid    = "SSMParameter"
-        Effect = "Allow"
-        Action = [
-          "ssm:GetParameter"
-        ]
-        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/cost-guardian/*"
       },
       {
         Sid    = "PricingAPI"
@@ -187,42 +140,7 @@ resource "aws_iam_role_policy" "lambda" {
         Resource = "*"
       },
       {
-        Sid    = "LambdaRemediation"
-        Effect = "Allow"
-        Action = [
-          "lambda:PutFunctionConcurrency",
-          "lambda:DeleteFunctionConcurrency",
-          "lambda:GetFunctionConcurrency"
-        ]
-        Resource = "*"
-      },
-      {
-        Sid    = "SNSNotification"
-        Effect = "Allow"
-        Action = [
-          "sns:Publish"
-        ]
-        Resource = aws_sns_topic.cost_alerts.arn
-      },
-      {
-        Sid    = "StepFunctions"
-        Effect = "Allow"
-        Action = [
-          "states:StartExecution"
-        ]
-        Resource = "arn:aws:states:${var.aws_region}:*:stateMachine:*"
-      },
-      {
-        Sid    = "AutoScaling"
-        Effect = "Allow"
-        Action = [
-          "application-autoscaling:RegisterScalableTarget",
-          "application-autoscaling:DeregisterScalableTarget"
-        ]
-        Resource = "*"
-      },
-      {
-        Sid    = "EC2Remediation"
+        Sid    = "EC2"
         Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
@@ -231,13 +149,30 @@ resource "aws_iam_role_policy" "lambda" {
         Resource = "*"
       },
       {
-        Sid    = "RDSRemediation"
+        Sid    = "RDS"
         Effect = "Allow"
         Action = [
           "rds:DescribeDBInstances",
           "rds:StopDBInstance"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "Lambda"
+        Effect = "Allow"
+        Action = [
+          "lambda:ListFunctions",
+          "lambda:PutFunctionConcurrency"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "SNS"
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = aws_sns_topic.alerts.arn
       }
     ]
   })
@@ -247,12 +182,12 @@ resource "aws_iam_role_policy" "lambda" {
 data "archive_file" "lambda" {
   type        = "zip"
   output_path = "${path.module}/.terraform/lambda.zip"
-  
+
   source {
-    content  = file("${path.module}/cost_engine.py")
-    filename = "cost_engine.py"
+    content  = file("${path.module}/aws_cost_guardian.py")
+    filename = "aws_cost_guardian.py"
   }
-  
+
   source {
     content  = file("${path.module}/lambda_handler.py")
     filename = "lambda_handler.py"
@@ -260,28 +195,28 @@ data "archive_file" "lambda" {
 }
 
 # Lambda function
-resource "aws_lambda_function" "cost_guardian" {
+resource "aws_lambda_function" "guardian" {
   function_name = local.function_name
   role          = aws_iam_role.lambda.arn
   handler       = "lambda_handler.handler"
   runtime       = "python3.12"
-  timeout       = 60
+  timeout       = 120
   memory_size   = 256
-  
+
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
-  
+
   environment {
     variables = {
-      CONFIG_S3_BUCKET          = aws_s3_bucket.config.id
-      CONFIG_S3_KEY             = "cost-guardian/rules.json"
-      DRY_RUN                   = "false"
-      AWS_REGION                = var.aws_region
-      DEFAULT_EC2_HOURLY_COST   = var.default_ec2_hourly_cost
-      DEFAULT_RDS_HOURLY_COST   = var.default_rds_hourly_cost
+      REGIONS             = jsonencode(var.regions)
+      TOTAL_BUDGET        = tostring(var.total_budget)
+      ALERT_THRESHOLDS    = jsonencode(var.alert_thresholds)
+      AUTO_STOP_THRESHOLD = tostring(var.auto_stop_threshold)
+      SNS_TOPIC_ARN       = aws_sns_topic.alerts.arn
+      DRY_RUN             = "false"
     }
   }
-  
+
   tags = local.tags
 }
 
@@ -295,82 +230,42 @@ resource "aws_cloudwatch_log_group" "lambda" {
 # CloudWatch Event Rule - Scheduled trigger
 resource "aws_cloudwatch_event_rule" "schedule" {
   name                = "${local.function_name}-schedule"
-  description         = "Trigger Cost Guardian evaluation"
-  schedule_expression = var.evaluation_schedule
+  description         = "Trigger Cost Guardian check"
+  schedule_expression = var.check_interval
   tags                = local.tags
 }
 
 resource "aws_cloudwatch_event_target" "lambda" {
   rule      = aws_cloudwatch_event_rule.schedule.name
   target_id = "cost-guardian-lambda"
-  arn       = aws_lambda_function.cost_guardian.arn
+  arn       = aws_lambda_function.guardian.arn
 }
 
 resource "aws_lambda_permission" "cloudwatch" {
   statement_id  = "AllowCloudWatchInvoke"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.cost_guardian.function_name
+  function_name = aws_lambda_function.guardian.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.schedule.arn
 }
 
-# CloudWatch Dashboard
-resource "aws_cloudwatch_dashboard" "cost_guardian" {
-  dashboard_name = "CostGuardian-${var.environment}"
-  
-  dashboard_body = jsonencode({
-    widgets = [
-      {
-        type   = "metric"
-        x      = 0
-        y      = 0
-        width  = 12
-        height = 6
-        properties = {
-          title  = "Cost Guardian Invocations"
-          region = var.aws_region
-          metrics = [
-            ["AWS/Lambda", "Invocations", "FunctionName", local.function_name],
-            [".", "Errors", ".", "."],
-            [".", "Duration", ".", ".", { stat = "Average" }]
-          ]
-          period = 60
-          stat   = "Sum"
-        }
-      },
-      {
-        type   = "log"
-        x      = 12
-        y      = 0
-        width  = 12
-        height = 6
-        properties = {
-          title  = "Cost Breaches (Last Hour)"
-          region = var.aws_region
-          query  = "SOURCE '/aws/lambda/${local.function_name}' | fields @timestamp, @message | filter @message like /BREACH/ | sort @timestamp desc | limit 50"
-        }
-      }
-    ]
-  })
-}
-
 # Outputs
 output "lambda_function_name" {
-  value = aws_lambda_function.cost_guardian.function_name
+  value = aws_lambda_function.guardian.function_name
 }
 
 output "lambda_function_arn" {
-  value = aws_lambda_function.cost_guardian.arn
-}
-
-output "config_bucket" {
-  value = aws_s3_bucket.config.id
+  value = aws_lambda_function.guardian.arn
 }
 
 output "sns_topic_arn" {
-  value = aws_sns_topic.cost_alerts.arn
+  value = aws_sns_topic.alerts.arn
 }
 
-output "dashboard_url" {
-  value = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=CostGuardian-${var.environment}"
+output "monitored_regions" {
+  value = var.regions
+}
+
+output "budget" {
+  value = "$${var.total_budget}"
 }
