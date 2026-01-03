@@ -57,6 +57,30 @@ variable "check_interval" {
   default     = "rate(1 hour)"
 }
 
+variable "lambda_lookback_hours" {
+  description = "Hours to look back for Lambda cost projection"
+  type        = number
+  default     = 24
+}
+
+variable "lambda_spike_threshold" {
+  description = "Alert if Lambda rate exceeds Nx baseline"
+  type        = number
+  default     = 10
+}
+
+variable "lambda_spike_window_minutes" {
+  description = "Minutes to check for Lambda spikes"
+  type        = number
+  default     = 5
+}
+
+variable "lambda_baseline_hours" {
+  description = "Hours of baseline for spike comparison"
+  type        = number
+  default     = 168
+}
+
 variable "environment" {
   description = "Environment name"
   type        = string
@@ -167,6 +191,14 @@ resource "aws_iam_role_policy" "lambda" {
         Resource = "*"
       },
       {
+        Sid    = "CloudWatchMetrics"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:GetMetricStatistics"
+        ]
+        Resource = "*"
+      },
+      {
         Sid    = "SNS"
         Effect = "Allow"
         Action = [
@@ -208,12 +240,16 @@ resource "aws_lambda_function" "guardian" {
 
   environment {
     variables = {
-      REGIONS             = jsonencode(var.regions)
-      TOTAL_BUDGET        = tostring(var.total_budget)
-      ALERT_THRESHOLDS    = jsonencode(var.alert_thresholds)
-      AUTO_STOP_THRESHOLD = tostring(var.auto_stop_threshold)
-      SNS_TOPIC_ARN       = aws_sns_topic.alerts.arn
-      DRY_RUN             = "false"
+      REGIONS                      = jsonencode(var.regions)
+      TOTAL_BUDGET                 = tostring(var.total_budget)
+      ALERT_THRESHOLDS             = jsonencode(var.alert_thresholds)
+      AUTO_STOP_THRESHOLD          = tostring(var.auto_stop_threshold)
+      SNS_TOPIC_ARN                = aws_sns_topic.alerts.arn
+      DRY_RUN                      = "false"
+      LAMBDA_LOOKBACK_HOURS        = tostring(var.lambda_lookback_hours)
+      LAMBDA_SPIKE_THRESHOLD       = tostring(var.lambda_spike_threshold)
+      LAMBDA_SPIKE_WINDOW_MINUTES  = tostring(var.lambda_spike_window_minutes)
+      LAMBDA_BASELINE_HOURS        = tostring(var.lambda_baseline_hours)
     }
   }
 
