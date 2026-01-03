@@ -1,0 +1,194 @@
+{
+  "rules": [
+    {
+      "rule_id": "lambda-high-invocation-rate",
+      "description": "Throttle Lambda if projected 10-minute cost exceeds $5",
+      "metric_namespace": "AWS/Lambda",
+      "metric_name": "Invocations",
+      "dimensions": [
+        {"Name": "FunctionName", "Value": "my-expensive-function"}
+      ],
+      "lookback_seconds": 120,
+      "projection_seconds": 600,
+      "unit_cost": "0.0000002",
+      "threshold": "5.00",
+      "statistic": "Sum",
+      "period": 60,
+      "remediation_action": "throttle_lambda",
+      "remediation_params": {
+        "function_name": "my-expensive-function",
+        "concurrency": 10
+      }
+    },
+    {
+      "rule_id": "lambda-runaway-detection",
+      "description": "Disable Lambda completely if projected cost exceeds $50 in 10 minutes",
+      "metric_namespace": "AWS/Lambda",
+      "metric_name": "Invocations",
+      "dimensions": [
+        {"Name": "FunctionName", "Value": "my-expensive-function"}
+      ],
+      "lookback_seconds": 120,
+      "projection_seconds": 600,
+      "unit_cost": "0.0000002",
+      "threshold": "50.00",
+      "statistic": "Sum",
+      "period": 60,
+      "remediation_action": "disable_lambda",
+      "remediation_params": {
+        "function_name": "my-expensive-function"
+      }
+    },
+    {
+      "rule_id": "api-gateway-cost-alert",
+      "description": "Alert via SNS if API Gateway request cost projection exceeds $10",
+      "metric_namespace": "AWS/ApiGateway",
+      "metric_name": "Count",
+      "dimensions": [
+        {"Name": "ApiName", "Value": "my-api"}
+      ],
+      "lookback_seconds": 300,
+      "projection_seconds": 3600,
+      "unit_cost": "0.0000035",
+      "threshold": "10.00",
+      "statistic": "Sum",
+      "period": 60,
+      "remediation_action": "notify_sns",
+      "remediation_params": {
+        "topic_arn": "arn:aws:sns:us-east-1:123456789012:cost-alerts"
+      }
+    },
+    {
+      "rule_id": "dynamodb-capacity-runaway",
+      "description": "Trigger Step Function for DynamoDB cost spike investigation",
+      "metric_namespace": "AWS/DynamoDB",
+      "metric_name": "ConsumedWriteCapacityUnits",
+      "dimensions": [
+        {"Name": "TableName", "Value": "my-table"}
+      ],
+      "lookback_seconds": 300,
+      "projection_seconds": 1800,
+      "unit_cost": "0.00000125",
+      "threshold": "25.00",
+      "statistic": "Sum",
+      "period": 60,
+      "remediation_action": "start_step_function",
+      "remediation_params": {
+        "state_machine_arn": "arn:aws:states:us-east-1:123456789012:stateMachine:CostRemediationWorkflow",
+        "additional_params": {
+          "notify_slack": true,
+          "auto_scale_down": true
+        }
+      }
+    },
+    {
+      "rule_id": "sqs-high-throughput",
+      "description": "Alert on SQS message cost spike",
+      "metric_namespace": "AWS/SQS",
+      "metric_name": "NumberOfMessagesSent",
+      "dimensions": [
+        {"Name": "QueueName", "Value": "high-volume-queue"}
+      ],
+      "lookback_seconds": 120,
+      "projection_seconds": 600,
+      "unit_cost": "0.0000004",
+      "threshold": "2.00",
+      "statistic": "Sum",
+      "period": 60,
+      "remediation_action": "notify_sns",
+      "remediation_params": {
+        "topic_arn": "arn:aws:sns:us-east-1:123456789012:cost-alerts"
+      }
+    },
+    {
+      "rule_id": "kinesis-data-volume",
+      "description": "Scale down Kinesis on projected high data ingestion cost",
+      "metric_namespace": "AWS/Kinesis",
+      "metric_name": "IncomingRecords",
+      "dimensions": [
+        {"Name": "StreamName", "Value": "my-stream"}
+      ],
+      "lookback_seconds": 300,
+      "projection_seconds": 1800,
+      "unit_cost": "0.000000014",
+      "threshold": "15.00",
+      "statistic": "Sum",
+      "period": 60,
+      "remediation_action": "scale_down",
+      "remediation_params": {
+        "service_namespace": "kinesis",
+        "resource_id": "stream/my-stream",
+        "scalable_dimension": "kinesis:stream:WriteProvisionedThroughput",
+        "min_capacity": 1,
+        "max_capacity": 2
+      }
+    },
+    {
+      "rule_id": "ec2-development-cost-limit",
+      "description": "Stop development EC2 instances if projected hourly cost exceeds $25",
+      "metric_namespace": "AWS/EC2",
+      "metric_name": "CPUUtilization",
+      "dimensions": [],
+      "lookback_seconds": 300,
+      "projection_seconds": 3600,
+      "pricing_model": "hourly",
+      "threshold": "25.00",
+      "fallback_hourly_cost": "0.10",
+      "statistic": "Average",
+      "period": 300,
+      "instance_filter": {
+        "ec2_filters": [
+          {"Name": "tag:Environment", "Values": ["development"]}
+        ]
+      },
+      "remediation_action": "stop_ec2",
+      "remediation_params": {
+        "notify_before": true,
+        "topic_arn": "arn:aws:sns:us-east-1:123456789012:cost-alerts"
+      }
+    },
+    {
+      "rule_id": "ec2-runaway-instance-detection",
+      "description": "Alert on unexpected EC2 instance cost spike (all instances)",
+      "metric_namespace": "AWS/EC2",
+      "metric_name": "CPUUtilization",
+      "dimensions": [],
+      "lookback_seconds": 300,
+      "projection_seconds": 3600,
+      "pricing_model": "hourly",
+      "threshold": "100.00",
+      "fallback_hourly_cost": "0.10",
+      "statistic": "Average",
+      "period": 60,
+      "instance_filter": {
+        "ec2_filters": []
+      },
+      "remediation_action": "notify_sns",
+      "remediation_params": {
+        "topic_arn": "arn:aws:sns:us-east-1:123456789012:cost-alerts"
+      }
+    },
+    {
+      "rule_id": "rds-idle-detection",
+      "description": "Stop idle RDS instances if projected hourly cost exceeds $15",
+      "metric_namespace": "AWS/RDS",
+      "metric_name": "CPUUtilization",
+      "dimensions": [],
+      "lookback_seconds": 300,
+      "projection_seconds": 3600,
+      "pricing_model": "hourly",
+      "threshold": "15.00",
+      "fallback_hourly_cost": "0.15",
+      "statistic": "Average",
+      "period": 300,
+      "instance_filter": {
+        "rds_filters": {}
+      },
+      "remediation_action": "stop_rds",
+      "remediation_params": {
+        "notify_before": true,
+        "topic_arn": "arn:aws:sns:us-east-1:123456789012:cost-alerts"
+      }
+    }
+  ]
+}
