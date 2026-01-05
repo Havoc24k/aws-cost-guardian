@@ -72,6 +72,7 @@ class BudgetGuardian:
         lambda_spike_threshold: int = DEFAULT_LAMBDA_SPIKE_THRESHOLD,
         lambda_spike_window_minutes: int = DEFAULT_LAMBDA_SPIKE_WINDOW_MINUTES,
         lambda_baseline_hours: int = DEFAULT_LAMBDA_BASELINE_HOURS,
+        exclude_lambdas: Optional[list[str]] = None,
     ):
         self.regions = regions
         self.budget = Decimal(str(total_budget))
@@ -82,6 +83,7 @@ class BudgetGuardian:
         self.lambda_spike_threshold = lambda_spike_threshold
         self.lambda_spike_window_minutes = lambda_spike_window_minutes
         self.lambda_baseline_hours = lambda_baseline_hours
+        self.exclude_lambdas = set(exclude_lambdas or [])
 
         # Clients (Cost Explorer is global, others are regional)
         self.ce = boto3.client("ce", region_name="us-east-1")
@@ -90,6 +92,12 @@ class BudgetGuardian:
     @classmethod
     def from_env(cls) -> "BudgetGuardian":
         """Create instance from Lambda environment variables."""
+        # Auto-exclude the current Lambda function (AWS_LAMBDA_FUNCTION_NAME is set by AWS)
+        exclude = []
+        current_function = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        if current_function:
+            exclude.append(current_function)
+
         return cls(
             regions=json.loads(os.environ.get("REGIONS", '["us-east-1"]')),
             total_budget=Decimal(os.environ.get("TOTAL_BUDGET", "1000")),
@@ -100,6 +108,7 @@ class BudgetGuardian:
             lambda_spike_threshold=int(os.environ.get("LAMBDA_SPIKE_THRESHOLD", "10")),
             lambda_spike_window_minutes=int(os.environ.get("LAMBDA_SPIKE_WINDOW_MINUTES", "5")),
             lambda_baseline_hours=int(os.environ.get("LAMBDA_BASELINE_HOURS", "168")),
+            exclude_lambdas=exclude,
         )
 
     def check_budget(self) -> BudgetStatus:
@@ -237,7 +246,8 @@ class BudgetGuardian:
                     for func in lam_page.get("Functions", []):
                         func_name = func.get("FunctionName")
                         memory_mb = func.get("MemorySize", 128)
-                        if func_name:
+                        # Skip excluded functions (e.g., cost-guardian itself)
+                        if func_name and func_name not in self.exclude_lambdas:
                             resources["lambda"].append(
                                 {
                                     "name": func_name,
@@ -638,6 +648,17 @@ class BudgetGuardian:
         for func in resources["lambda"]:
             try:
                 lam = boto3.client("lambda", region_name=func["region"])
+                # Check if already throttled
+                try:
+                    current = lam.get_function_concurrency(FunctionName=func["name"])
+                    if current.get("ReservedConcurrentExecutions") == 0:
+                        results["lambda"].append(
+                            {"name": func["name"], "status": "already_throttled"}
+                        )
+                        continue
+                except ClientError:
+                    pass  # No concurrency set, proceed to throttle
+
                 if not dry_run:
                     lam.put_function_concurrency(
                         FunctionName=func["name"], ReservedConcurrentExecutions=0
@@ -716,7 +737,14 @@ Remediation Executed:
 
         if status.action == "stop_all":
             stop_results = self.stop_all_resources(status.resources, dry_run=dry_run)
-            alert_sent = self.send_alert(status, stop_results) is not None
+            # Only send alert if at least one resource was actually changed
+            actually_changed = (
+                len([r for r in stop_results["ec2"] if r["status"] == "stopped"])
+                + len([r for r in stop_results["rds"] if r["status"] == "stopped"])
+                + len([r for r in stop_results["lambda"] if r["status"] == "throttled"])
+            )
+            if actually_changed > 0:
+                alert_sent = self.send_alert(status, stop_results) is not None
 
         elif status.action == "alert":
             alert_sent = self.send_alert(status) is not None

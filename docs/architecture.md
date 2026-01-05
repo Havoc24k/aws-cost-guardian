@@ -8,13 +8,16 @@
 flowchart TD
     A[Hourly Check] --> B[Cost Explorer]
     B --> C{total > budget?}
-    C -->|YES| D[STOP ALL immediate]
+    C -->|YES| D[STOP ALL]
     C -->|NO| E[EC2/RDS/Lambda Discovery]
     E --> F[Budget Calculation]
     F --> G{projected %}
     G -->|< 75%| H[OK]
     G -->|75-100%| I[ALERT]
-    G -->|> 100%| J[STOP ALL]
+    G -->|> 100%| D
+    D --> K{already remediated?}
+    K -->|YES| L[Skip Alert]
+    K -->|NO| M[Send Alert]
 ```
 
 ### Immediate Remediation
@@ -66,6 +69,14 @@ Monthly:       ~$1,950
 | RDS | `stop_db_instance` |
 | Lambda | `put_function_concurrency(0)` |
 
+## Alert Suppression
+
+Alerts are only sent when actual changes are made:
+- EC2/RDS already stopped - not discovered, no action needed
+- Lambda already throttled (concurrency=0) - detected, skipped
+
+This prevents duplicate alerts on repeated runs when resources are already remediated.
+
 ## IAM Permissions
 
 ```json
@@ -77,6 +88,7 @@ Monthly:       ~$1,950
     "rds:DescribeDBInstances",
     "rds:StopDBInstance",
     "lambda:ListFunctions",
+    "lambda:GetFunctionConcurrency",
     "lambda:PutFunctionConcurrency",
     "cloudwatch:GetMetricStatistics",
     "sns:Publish",

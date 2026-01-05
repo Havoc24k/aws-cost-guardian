@@ -100,6 +100,7 @@ resource "aws_iam_role_policy" "lambda" {
         Effect = "Allow"
         Action = [
           "lambda:ListFunctions",
+          "lambda:GetFunctionConcurrency",
           "lambda:PutFunctionConcurrency"
         ]
         Resource = "*"
