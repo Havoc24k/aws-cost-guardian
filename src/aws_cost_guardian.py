@@ -680,7 +680,12 @@ class BudgetGuardian:
         if self._account_info is not None:
             return self._account_info
 
-        info: dict[str, str] = {"account_id": "unknown", "account_name": "", "org_id": ""}
+        info: dict[str, str] = {
+            "account_id": "unknown",
+            "account_name": "",
+            "org_id": "",
+            "org_management_id": "",
+        }
 
         # Get account ID from STS
         try:
@@ -699,11 +704,12 @@ class BudgetGuardian:
         except (BotoCoreError, ClientError):
             pass
 
-        # Get organization ID if in an org
+        # Get organization info if in an org
         try:
             orgs = boto3.client("organizations")
             org = orgs.describe_organization().get("Organization", {})
             info["org_id"] = org.get("Id", "")
+            info["org_management_id"] = org.get("MasterAccountId", "")
         except (BotoCoreError, ClientError):
             pass  # Not in an organization or no permission
 
@@ -736,6 +742,8 @@ class BudgetGuardian:
             account_line += f" ({account['account_name']})"
         if account["org_id"]:
             account_line += f"\nOrganization: {account['org_id']}"
+            if account["org_management_id"]:
+                account_line += f" (Management: {account['org_management_id']})"
 
         message = f"""AWS Cost Guardian Alert
 
