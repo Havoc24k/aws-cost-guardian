@@ -146,11 +146,15 @@ class BudgetGuardian:
         )
 
     def _get_actual_spend(self) -> Decimal:
-        """Get total account spend from Cost Explorer (up to 14 months history)."""
+        """Get total account spend from Cost Explorer (up to 13 months history).
+
+        See: https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html
+        """
         now = datetime.now(timezone.utc)
         end = now.strftime("%Y-%m-%d")
-        # Cost Explorer supports up to 14 months of data
-        start = (now - timedelta(days=400)).strftime("%Y-%m-%d")
+        # Cost Explorer supports up to 13 months of historical data
+        # Ref: https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html
+        start = (now - timedelta(days=395)).strftime("%Y-%m-%d")
 
         try:
             response = self.ce.get_cost_and_usage(
