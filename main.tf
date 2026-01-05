@@ -120,6 +120,16 @@ resource "aws_iam_role_policy" "lambda" {
           "sns:Publish"
         ]
         Resource = aws_sns_topic.alerts.arn
+      },
+      {
+        Sid    = "AccountInfo"
+        Effect = "Allow"
+        Action = [
+          "sts:GetCallerIdentity",
+          "iam:ListAccountAliases",
+          "organizations:DescribeOrganization"
+        ]
+        Resource = "*"
       }
     ]
   })

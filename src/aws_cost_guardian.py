@@ -88,6 +88,7 @@ class BudgetGuardian:
         # Clients (Cost Explorer is global, others are regional)
         self.ce = boto3.client("ce", region_name="us-east-1")
         self.sns = boto3.client("sns") if sns_topic_arn else None
+        self._account_info: Optional[dict[str, str]] = None
 
     @classmethod
     def from_env(cls) -> "BudgetGuardian":
@@ -674,6 +675,41 @@ class BudgetGuardian:
 
         return results
 
+    def _get_account_info(self) -> dict[str, str]:
+        """Get AWS account info (ID, name, organization)."""
+        if self._account_info is not None:
+            return self._account_info
+
+        info: dict[str, str] = {"account_id": "unknown", "account_name": "", "org_id": ""}
+
+        # Get account ID from STS
+        try:
+            sts = boto3.client("sts")
+            identity = sts.get_caller_identity()
+            info["account_id"] = identity.get("Account", "unknown")
+        except (BotoCoreError, ClientError):
+            pass
+
+        # Get account alias (name) from IAM
+        try:
+            iam = boto3.client("iam")
+            aliases = iam.list_account_aliases().get("AccountAliases", [])
+            if aliases:
+                info["account_name"] = aliases[0]
+        except (BotoCoreError, ClientError):
+            pass
+
+        # Get organization ID if in an org
+        try:
+            orgs = boto3.client("organizations")
+            org = orgs.describe_organization().get("Organization", {})
+            info["org_id"] = org.get("Id", "")
+        except (BotoCoreError, ClientError):
+            pass  # Not in an organization or no permission
+
+        self._account_info = info
+        return info
+
     def send_alert(
         self, status: BudgetStatus, stop_results: Optional[dict[str, Any]] = None
     ) -> Optional[str]:
@@ -693,7 +729,17 @@ class BudgetGuardian:
         else:
             status_line = status.action.upper()
 
+        # Get account info
+        account = self._get_account_info()
+        account_line = f"Account ID: {account['account_id']}"
+        if account["account_name"]:
+            account_line += f" ({account['account_name']})"
+        if account["org_id"]:
+            account_line += f"\nOrganization: {account['org_id']}"
+
         message = f"""AWS Cost Guardian Alert
+
+{account_line}
 
 Status: {status_line}
 Budget: ${status.budget}

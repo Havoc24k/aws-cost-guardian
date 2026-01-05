@@ -92,7 +92,10 @@ This prevents duplicate alerts on repeated runs when resources are already remed
     "lambda:PutFunctionConcurrency",
     "cloudwatch:GetMetricStatistics",
     "sns:Publish",
-    "pricing:GetProducts"
+    "pricing:GetProducts",
+    "sts:GetCallerIdentity",
+    "iam:ListAccountAliases",
+    "organizations:DescribeOrganization"
   ]
 }
 ```
