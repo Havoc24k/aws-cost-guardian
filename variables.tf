@@ -69,3 +69,9 @@ variable "environment" {
   type        = string
   default     = "poc"
 }
+
+variable "dry_run" {
+  description = "When true, report actions via email without executing them"
+  type        = bool
+  default     = true
+}

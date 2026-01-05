@@ -717,20 +717,28 @@ class BudgetGuardian:
         return info
 
     def send_alert(
-        self, status: BudgetStatus, stop_results: Optional[dict[str, Any]] = None
+        self,
+        status: BudgetStatus,
+        stop_results: Optional[dict[str, Any]] = None,
+        dry_run: bool = False,
     ) -> Optional[str]:
         """Send alert via SNS."""
         if not self.sns_topic_arn or not self.sns:
             return None
 
+        # Build subject prefix for dry_run mode
+        prefix = "[DRY RUN] " if dry_run else ""
+
         # Different subject based on whether actual spend exceeded budget
         if status.actual_exceeded:
-            subject = f"BUDGET EXCEEDED: ${status.actual_spend:.2f} spent > ${status.budget} budget"
+            subject = f"{prefix}BUDGET EXCEEDED: ${status.actual_spend:.2f} spent > ${status.budget} budget"
         else:
-            subject = f"Budget Alert: {status.budget_percent:.0f}% of ${status.budget}"
+            subject = f"{prefix}Budget Alert: {status.budget_percent:.0f}% of ${status.budget}"
 
-        # Status line differs based on actual exceeded
-        if status.actual_exceeded:
+        # Status line differs based on actual exceeded and dry_run
+        if dry_run:
+            status_line = "DRY RUN - Actions that WOULD be taken (no changes made)"
+        elif status.actual_exceeded:
             status_line = "ACTUAL SPEND EXCEEDED - Immediate remediation triggered"
         else:
             status_line = status.action.upper()
@@ -791,14 +799,14 @@ Remediation Executed:
 
         if status.action == "stop_all":
             stop_results = self.stop_all_resources(status.resources, dry_run=dry_run)
-            # Only send alert if at least one resource was actually changed
+            # Only send alert if at least one resource was actually changed (or would be in dry_run)
             actually_changed = (
-                len([r for r in stop_results["ec2"] if r["status"] == "stopped"])
-                + len([r for r in stop_results["rds"] if r["status"] == "stopped"])
-                + len([r for r in stop_results["lambda"] if r["status"] == "throttled"])
+                len([r for r in stop_results["ec2"] if r["status"] in ("stopped", "dry_run")])
+                + len([r for r in stop_results["rds"] if r["status"] in ("stopped", "dry_run")])
+                + len([r for r in stop_results["lambda"] if r["status"] in ("throttled", "dry_run")])
             )
             if actually_changed > 0:
-                alert_sent = self.send_alert(status, stop_results) is not None
+                alert_sent = self.send_alert(status, stop_results, dry_run=dry_run) is not None
 
         elif status.action == "alert":
             alert_sent = self.send_alert(status) is not None

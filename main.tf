@@ -170,7 +170,7 @@ resource "aws_lambda_function" "guardian" {
       ALERT_THRESHOLDS            = jsonencode(var.alert_thresholds)
       AUTO_STOP_THRESHOLD         = tostring(var.auto_stop_threshold)
       SNS_TOPIC_ARN               = aws_sns_topic.alerts.arn
-      DRY_RUN                     = "false"
+      DRY_RUN                     = tostring(var.dry_run)
       LAMBDA_LOOKBACK_HOURS       = tostring(var.lambda_lookback_hours)
       LAMBDA_SPIKE_THRESHOLD      = tostring(var.lambda_spike_threshold)
       LAMBDA_SPIKE_WINDOW_MINUTES = tostring(var.lambda_spike_window_minutes)
