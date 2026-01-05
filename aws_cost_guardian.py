@@ -55,6 +55,7 @@ class BudgetStatus:
     action: str  # 'ok', 'alert', 'stop_all', 'spike_alert'
     thresholds_breached: list[int]
     lambda_spikes: list[LambdaSpike]
+    actual_exceeded: bool = False  # True if actual_spend > budget
 
 
 class BudgetGuardian:
@@ -122,9 +123,11 @@ class BudgetGuardian:
 
         # 6. Determine action
         budget_percent = (projected_total / self.budget) * 100 if self.budget > 0 else Decimal("0")
-        action, thresholds_breached = self._determine_action(budget_percent)
+        action, thresholds_breached, actual_exceeded = self._determine_action(
+            budget_percent, actual_spend
+        )
 
-        # Override action if spike detected
+        # Override action if spike detected (but not if already stopping)
         if lambda_spikes and action == "ok":
             action = "spike_alert"
 
@@ -139,13 +142,15 @@ class BudgetGuardian:
             action=action,
             thresholds_breached=thresholds_breached,
             lambda_spikes=lambda_spikes,
+            actual_exceeded=actual_exceeded,
         )
 
     def _get_actual_spend(self) -> Decimal:
-        """Get month-to-date spend from Cost Explorer."""
+        """Get total account spend from Cost Explorer (up to 14 months history)."""
         now = datetime.now(timezone.utc)
-        start = now.replace(day=1).strftime("%Y-%m-%d")
         end = now.strftime("%Y-%m-%d")
+        # Cost Explorer supports up to 14 months of data
+        start = (now - timedelta(days=400)).strftime("%Y-%m-%d")
 
         try:
             response = self.ce.get_cost_and_usage(
@@ -153,13 +158,14 @@ class BudgetGuardian:
                 Granularity="MONTHLY",
                 Metrics=["UnblendedCost"],
             )
-            results = response.get("ResultsByTime", [])
-            if results:
-                total = results[0].get("Total", {})
+            # Sum all months
+            total_cost = Decimal("0")
+            for result in response.get("ResultsByTime", []):
+                total = result.get("Total", {})
                 cost_data = total.get("UnblendedCost", {})
                 amount = cost_data.get("Amount", "0")
-                return Decimal(amount)
-            return Decimal("0")
+                total_cost += Decimal(amount)
+            return total_cost
         except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
             print(f"Cost Explorer error: {e}")
             return Decimal("0")
@@ -570,15 +576,26 @@ class BudgetGuardian:
         remaining = end_of_month - now
         return max(0, int(remaining.total_seconds() / 3600))
 
-    def _determine_action(self, budget_percent: Decimal) -> tuple[str, list[int]]:
-        """Determine action based on budget percentage."""
+    def _determine_action(
+        self, budget_percent: Decimal, actual_spend: Decimal
+    ) -> tuple[str, list[int], bool]:
+        """Determine action based on budget percentage and actual spend.
+
+        Returns:
+            tuple of (action, thresholds_breached, actual_exceeded)
+        """
         breached = [t for t in self.alert_thresholds if budget_percent >= t]
+        actual_exceeded = actual_spend > self.budget
+
+        # If actual spend already exceeds budget, force stop_all immediately
+        if actual_exceeded:
+            return "stop_all", list(self.alert_thresholds), True
 
         if budget_percent >= self.auto_stop_threshold:
-            return "stop_all", breached
+            return "stop_all", breached, False
         if breached:
-            return "alert", breached
-        return "ok", []
+            return "alert", breached, False
+        return "ok", [], False
 
     def stop_all_resources(
         self, resources: dict[str, Any], dry_run: bool = False
@@ -639,11 +656,21 @@ class BudgetGuardian:
         if not self.sns_topic_arn or not self.sns:
             return None
 
-        subject = f"Budget Alert: {status.budget_percent:.0f}% of ${status.budget}"
+        # Different subject based on whether actual spend exceeded budget
+        if status.actual_exceeded:
+            subject = f"BUDGET EXCEEDED: ${status.actual_spend:.2f} spent > ${status.budget} budget"
+        else:
+            subject = f"Budget Alert: {status.budget_percent:.0f}% of ${status.budget}"
+
+        # Status line differs based on actual exceeded
+        if status.actual_exceeded:
+            status_line = "ACTUAL SPEND EXCEEDED - Immediate remediation triggered"
+        else:
+            status_line = status.action.upper()
 
         message = f"""AWS Cost Guardian Alert
 
-Status: {status.action.upper()}
+Status: {status_line}
 Budget: ${status.budget}
 Actual Spend: ${status.actual_spend:.2f}
 Projected Total: ${status.projected_total:.2f}

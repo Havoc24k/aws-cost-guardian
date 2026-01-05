@@ -34,6 +34,9 @@ terraform apply \
 
 See [Terraform docs](docs/terraform.md) for all options.
 
+**Note:** If deploying to an account where actual spend already exceeds the budget,
+resources will be stopped immediately on first run.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) - How budget projection works

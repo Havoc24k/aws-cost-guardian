@@ -9,7 +9,7 @@ uv run python cli.py --budget 1000 --regions eu-central-1 status
 # Output:
 # Budget Status
 # ========================================
-# Actual Spend (MTD):    $17.64
+# Total Spend:           $17.64
 # Hourly Cost:           $0.05
 # Projected Total:       $50.23
 # Budget:                $1000.00
@@ -70,6 +70,34 @@ uv run python cli.py --lambda-lookback 168 --regions eu-central-1 status
 
 # Use 1-hour for recent activity
 uv run python cli.py --lambda-lookback 1 --regions eu-central-1 status
+```
+
+## Actual Spend Exceeded
+
+When actual spend already exceeds the budget, immediate remediation is triggered:
+
+```bash
+# Budget lower than actual spend
+uv run python cli.py --budget 10 --regions eu-central-1 status
+
+# Output:
+# Budget Status
+# ========================================
+# Total Spend:           $2772.89
+# Hourly Cost:           $0.05
+# Projected Total:       $2803.52
+# Budget:                $1000.00
+# Budget Used:           280.4%
+# STATUS:                ACTUAL SPEND EXCEEDED
+# Hours Until Month End: 638
+#
+# Running Resources
+# ----------------------------------------
+# EC2 Instances:         1
+# RDS Instances:         0
+# Lambda Functions:      2
+#
+# Action: STOP_ALL (immediate - actual spend exceeded)
 ```
 
 ## Emergency Stop

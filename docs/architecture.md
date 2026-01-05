@@ -5,8 +5,16 @@
 ### Budget Projection
 
 ```
-Hourly Check --> Cost Explorer (actual spend)
-                        +
+Hourly Check --> Cost Explorer (total account spend)
+                        |
+                        v
+              total > budget?
+                   |
+          YES -----+-----> STOP ALL (immediate)
+                   |
+                   NO
+                   |
+                   v
               EC2/RDS/Lambda Discovery (hourly cost)
                         |
                         v
@@ -18,6 +26,26 @@ Hourly Check --> Cost Explorer (actual spend)
           < 75%      75-100%     > 100%
           (OK)      (ALERT)   (STOP ALL)
 ```
+
+### Immediate Remediation
+
+If actual spend already exceeds the budget, resources are stopped immediately
+regardless of projected costs. This handles deployments to accounts that have
+already overspent:
+
+```
+Actual Spend: $1,200
+Budget:       $1,000
+              |
+              v
+     actual > budget = TRUE
+              |
+              v
+     STOP ALL (immediate remediation)
+```
+
+This ensures that deploying to an account that's already over budget triggers
+immediate protection - no waiting for the next projection cycle.
 
 ### Lambda Cost Projection
 

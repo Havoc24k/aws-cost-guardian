@@ -31,11 +31,13 @@ def cmd_status(args):
 
     print("Budget Status")
     print("=" * 40)
-    print(f"Actual Spend (MTD):    ${status.actual_spend:.2f}")
+    print(f"Total Spend:           ${status.actual_spend:.2f}")
     print(f"Hourly Cost:           ${status.hourly_cost:.2f}")
     print(f"Projected Total:       ${status.projected_total:.2f}")
     print(f"Budget:                ${status.budget:.2f}")
     print(f"Budget Used:           {status.budget_percent:.1f}%")
+    if status.actual_exceeded:
+        print("STATUS:                ACTUAL SPEND EXCEEDED")
     print(f"Hours Until Month End: {status.remaining_hours}")
     print()
     print("Running Resources")
@@ -44,7 +46,10 @@ def cmd_status(args):
     print(f"RDS Instances:         {len(status.resources['rds'])}")
     print(f"Lambda Functions:      {len(status.resources['lambda'])}")
     print()
-    print(f"Action: {status.action.upper()}")
+    if status.actual_exceeded:
+        print(f"Action: {status.action.upper()} (immediate - actual spend exceeded)")
+    else:
+        print(f"Action: {status.action.upper()}")
 
     if status.thresholds_breached:
         print(f"Thresholds Breached: {status.thresholds_breached}%")
@@ -103,11 +108,17 @@ def cmd_test(args):
     print(f"Actual Spend: ${status.actual_spend:.2f}")
     print(f"Projected Total: ${status.projected_total:.2f}")
     print(f"Budget Used: {status.budget_percent:.1f}%")
-    print(f"Action: {status.action}")
+    if status.actual_exceeded:
+        print(f"Action: {status.action} (immediate - actual spend exceeded)")
+    else:
+        print(f"Action: {status.action}")
     print()
 
     if status.action == "stop_all":
-        print("Resources that would be stopped (dry run):")
+        if status.actual_exceeded:
+            print("ACTUAL SPEND EXCEEDED - Resources would be stopped immediately:")
+        else:
+            print("Resources that would be stopped (dry run):")
         print(f"  EC2: {len(status.resources['ec2'])} instances")
         print(f"  RDS: {len(status.resources['rds'])} instances")
         print(f"  Lambda: {len(status.resources['lambda'])} functions")
