@@ -4,25 +4,26 @@ Detects runaway Lambda costs within minutes by comparing current activity agains
 
 ## How It Works
 
+```mermaid
+flowchart LR
+    subgraph BASELINE["BASELINE WINDOW (7 days)"]
+        B1["10,080 invocations"]
+        B2["Rate: 0.1/min"]
+    end
+    subgraph SHORT["SHORT WINDOW (5 min)"]
+        S1["180 invocations"]
+        S2["Rate: 36/min"]
+    end
+    BASELINE --> C{Spike Ratio}
+    SHORT --> C
+    C --> D["36 / 0.1 = 360x"]
+    D --> E{"ratio >= 10x?"}
+    E -->|YES| F[ALERT]
 ```
-+-----------------------------------------------------------------+
-|                        TIME WINDOWS                              |
-+-----------------------------------------------------------------+
-|                                                                  |
-|  BASELINE WINDOW (7 days)                    SHORT WINDOW (5min) |
-|  <------------------------------------------>|<--->|             |
-|  |                                            |    |             |
-|  7 days ago                              5min ago  now           |
-|                                                                  |
-|  Total: 10,080 invocations                   180 invocations     |
-|  Rate:  10,080 / (7*24*60) = 0.1/min         180 / 5 = 36/min    |
-|                                                                  |
-+-----------------------------------------------------------------+
 
-SPIKE RATIO = current_rate / baseline_rate = 36 / 0.1 = 360x
+**Spike Ratio** = current_rate / baseline_rate
 
-If SPIKE RATIO >= THRESHOLD (default 10x) -> ALERT!
-```
+If ratio >= threshold (default 10x) -> ALERT
 
 ## Algorithm Steps
 
@@ -37,7 +38,7 @@ If SPIKE RATIO >= THRESHOLD (default 10x) -> ALERT!
 
 ## Real-World Example
 
-```
+```text
 Function: data-transformer (256MB)
 
 Historical pattern (December):

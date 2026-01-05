@@ -1,10 +1,47 @@
 # AWS Cost Guardian
 
-Simple POC account budget protection for AWS. Monitors actual spend + projected costs and automatically stops resources when budget is exceeded. Includes Lambda spike detection for early warning of runaway costs.
+Simple POC account budget protection for AWS. Monitors total account spend and automatically stops resources when budget is exceeded. Includes Lambda spike detection for early warning of runaway costs.
 
-## Quick Start
+## Terraform Module Usage
 
-### Local Testing
+Use directly from GitHub:
+
+```hcl
+module "cost_guardian" {
+  source = "github.com/Havoc24k/aws-cost-guardian"
+
+  total_budget = 1000
+  alert_email  = "ops@example.com"
+  regions      = ["us-east-1", "eu-central-1"]
+}
+```
+
+### Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `total_budget` | Yes | - | Total budget in USD |
+| `alert_email` | Yes | - | Email for alerts |
+| `regions` | No | `["us-east-1"]` | Regions to monitor |
+| `alert_thresholds` | No | `[50, 75, 90]` | Alert percentages |
+| `auto_stop_threshold` | No | `100` | Stop at this percentage |
+| `check_interval` | No | `rate(1 hour)` | Check frequency |
+| `lambda_spike_threshold` | No | `10` | Alert if Lambda rate >= Nx baseline |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `lambda_function_name` | Name of the Lambda function |
+| `lambda_function_arn` | ARN of the Lambda function |
+| `sns_topic_arn` | ARN of the SNS topic |
+
+See [examples/](examples/) for complete usage examples.
+
+**Note:** If deploying to an account where total spend already exceeds the budget,
+resources will be stopped immediately on first run.
+
+## Local CLI Testing
 
 ```bash
 # Install dependencies
@@ -18,24 +55,7 @@ uv run python cli.py --budget 1000 --regions us-east-1 status
 
 # Verbose output with resource details
 uv run python cli.py --budget 1000 --regions us-east-1 status -v
-
-# Multi-region check
-uv run python cli.py --budget 2000 --regions us-east-1,eu-central-1 status
 ```
-
-### Lambda Deployment
-
-```bash
-terraform init
-terraform apply \
-  -var="total_budget=1000" \
-  -var="alert_email=team@example.com"
-```
-
-See [Terraform docs](docs/terraform.md) for all options.
-
-**Note:** If deploying to an account where actual spend already exceeds the budget,
-resources will be stopped immediately on first run.
 
 ## Documentation
 
@@ -44,14 +64,19 @@ resources will be stopped immediately on first run.
 - [CLI Reference](docs/cli.md) - Command line usage and examples
 - [Terraform Deployment](docs/terraform.md) - Infrastructure variables and examples
 
-## Files
+## Project Structure
 
 ```
-aws_cost_guardian.py  # Core logic (~500 lines)
-lambda_handler.py     # Lambda entry point (~70 lines)
-cli.py                # Local CLI (~190 lines)
-main.tf               # Terraform infrastructure
-pyproject.toml        # Project dependencies
+main.tf               # Terraform resources
+variables.tf          # Input variables
+outputs.tf            # Output values
+versions.tf           # Provider requirements
+src/                  # Lambda code
+  aws_cost_guardian.py
+  lambda_handler.py
+examples/             # Usage examples
+  basic/
+cli.py                # Local CLI for testing
 docs/                 # Documentation
 ```
 
@@ -62,9 +87,6 @@ docs/                 # Documentation
 uv sync --all-extras
 
 # Run linters
-uv run ruff check *.py
-uv run mypy *.py
-
-# Format code
-uv run ruff format *.py
+uv run ruff check src/*.py cli.py
+uv run ruff format src/*.py cli.py
 ```

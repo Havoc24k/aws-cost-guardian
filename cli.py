@@ -8,7 +8,7 @@ import argparse
 import sys
 from decimal import Decimal
 
-from aws_cost_guardian import BudgetGuardian
+from src.aws_cost_guardian import BudgetGuardian  # noqa: E402
 
 
 def cmd_status(args):

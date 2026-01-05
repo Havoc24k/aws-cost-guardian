@@ -4,27 +4,17 @@
 
 ### Budget Projection
 
-```
-Hourly Check --> Cost Explorer (total account spend)
-                        |
-                        v
-              total > budget?
-                   |
-          YES -----+-----> STOP ALL (immediate)
-                   |
-                   NO
-                   |
-                   v
-              EC2/RDS/Lambda Discovery (hourly cost)
-                        |
-                        v
-              Budget Calculation
-              actual + (hourly_cost * remaining_hours)
-                        |
-             +----------+----------+
-             v          v          v
-          < 75%      75-100%     > 100%
-          (OK)      (ALERT)   (STOP ALL)
+```mermaid
+flowchart TD
+    A[Hourly Check] --> B[Cost Explorer]
+    B --> C{total > budget?}
+    C -->|YES| D[STOP ALL immediate]
+    C -->|NO| E[EC2/RDS/Lambda Discovery]
+    E --> F[Budget Calculation]
+    F --> G{projected %}
+    G -->|< 75%| H[OK]
+    G -->|75-100%| I[ALERT]
+    G -->|> 100%| J[STOP ALL]
 ```
 
 ### Immediate Remediation
@@ -33,15 +23,11 @@ If actual spend already exceeds the budget, resources are stopped immediately
 regardless of projected costs. This handles deployments to accounts that have
 already overspent:
 
-```
-Actual Spend: $1,200
-Budget:       $1,000
-              |
-              v
-     actual > budget = TRUE
-              |
-              v
-     STOP ALL (immediate remediation)
+```mermaid
+flowchart TD
+    A["Actual Spend: $1,200"] --> B{"actual > budget?"}
+    C["Budget: $1,000"] --> B
+    B -->|TRUE| D[STOP ALL]
 ```
 
 This ensures that deploying to an account that's already over budget triggers
@@ -51,7 +37,7 @@ immediate protection - no waiting for the next projection cycle.
 
 Lambda costs are calculated from CloudWatch metrics:
 
-```
+```text
 invocations_per_hour = CloudWatch Invocations / lookback_hours
 gb_seconds_per_hour = (duration_ms / 1000) * (memory_mb / 1024)
 
@@ -60,7 +46,8 @@ hourly_cost = invocations x $0.0000002
 ```
 
 Example with real data:
-```
+
+```text
 Function: data-transformer (256MB memory)
 Last 24h: 52,000 invocations, 4.3 hours total duration
 

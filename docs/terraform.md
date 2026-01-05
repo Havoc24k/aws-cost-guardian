@@ -1,28 +1,39 @@
 # Terraform Deployment
 
-## Quick Deploy
+## Module Usage
+
+Use the module directly from GitHub:
+
+```hcl
+module "cost_guardian" {
+  source = "github.com/Havoc24k/aws-cost-guardian"
+
+  total_budget = 1000
+  alert_email  = "ops@example.com"
+  regions      = ["us-east-1"]
+}
+```
+
+Multi-region with custom thresholds:
+
+```hcl
+module "cost_guardian" {
+  source = "github.com/Havoc24k/aws-cost-guardian"
+
+  total_budget            = 2000
+  alert_email             = "team@example.com"
+  regions                 = ["us-east-1", "eu-central-1"]
+  alert_thresholds        = [50, 75, 90]
+  auto_stop_threshold     = 100
+  lambda_spike_threshold  = 5
+}
+```
+
+Then deploy:
 
 ```bash
-# Basic deployment
 terraform init
-terraform apply \
-  -var="total_budget=1000" \
-  -var="alert_email=team@example.com"
-
-# Multi-region with custom thresholds
-terraform apply \
-  -var="total_budget=2000" \
-  -var="alert_email=team@example.com" \
-  -var='regions=["us-east-1","eu-central-1"]' \
-  -var='alert_thresholds=[50,75,90]' \
-  -var="auto_stop_threshold=100"
-
-# With sensitive spike detection (5x threshold, 1 min window)
-terraform apply \
-  -var="total_budget=1000" \
-  -var="alert_email=team@example.com" \
-  -var="lambda_spike_threshold=5" \
-  -var="lambda_spike_window_minutes=1"
+terraform apply
 ```
 
 ## Variables
@@ -124,7 +135,5 @@ These are set automatically by Terraform in the Lambda function:
 ## Cleanup
 
 ```bash
-terraform destroy \
-  -var="total_budget=1000" \
-  -var="alert_email=team@example.com"
+terraform destroy
 ```
