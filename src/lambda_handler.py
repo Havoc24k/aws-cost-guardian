@@ -57,13 +57,3 @@ def handler(event, _context):
             "dry_run": dry_run,
         },
     }
-
-
-if __name__ == "__main__":
-    # Local test
-    os.environ.setdefault("REGIONS", '["us-east-1"]')
-    os.environ.setdefault("TOTAL_BUDGET", "1000")
-    os.environ.setdefault("DRY_RUN", "true")
-
-    test_result = handler({"dry_run": True}, None)
-    print(json.dumps(test_result, indent=2))

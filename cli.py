@@ -8,20 +8,32 @@ import argparse
 import sys
 from decimal import Decimal
 
-from src.aws_cost_guardian import BudgetGuardian  # noqa: E402
+from src.aws_cost_guardian import BudgetGuardian, BudgetStatus  # noqa: E402
+
+
+def _create_guardian(args, budget: Decimal | None = None) -> BudgetGuardian:
+    """Create BudgetGuardian from CLI args."""
+    return BudgetGuardian(
+        regions=args.regions.split(","),
+        total_budget=budget if budget is not None else Decimal(args.budget),
+        alert_thresholds=[50, 75, 90],
+        auto_stop_threshold=100,
+        lambda_lookback_hours=getattr(args, "lambda_lookback", 24),
+        lambda_spike_threshold=getattr(args, "spike_threshold", 10),
+        lambda_spike_window_minutes=getattr(args, "spike_window", 5),
+    )
+
+
+def _format_action(status: BudgetStatus) -> str:
+    """Format action string with actual_exceeded indicator."""
+    if status.actual_exceeded:
+        return f"{status.action.upper()} (immediate - actual spend exceeded)"
+    return status.action.upper()
 
 
 def cmd_status(args):
     """Check current budget status."""
-    guardian = BudgetGuardian(
-        regions=args.regions.split(","),
-        total_budget=Decimal(args.budget),
-        alert_thresholds=[50, 75, 90],
-        auto_stop_threshold=100,
-        lambda_lookback_hours=args.lambda_lookback,
-        lambda_spike_threshold=args.spike_threshold,
-        lambda_spike_window_minutes=args.spike_window,
-    )
+    guardian = _create_guardian(args)
 
     print(f"Checking budget across regions: {guardian.regions}")
     print(f"Total budget: ${guardian.budget}")
@@ -46,10 +58,7 @@ def cmd_status(args):
     print(f"RDS Instances:         {len(status.resources['rds'])}")
     print(f"Lambda Functions:      {len(status.resources['lambda'])}")
     print()
-    if status.actual_exceeded:
-        print(f"Action: {status.action.upper()} (immediate - actual spend exceeded)")
-    else:
-        print(f"Action: {status.action.upper()}")
+    print(f"Action: {_format_action(status)}")
 
     if status.thresholds_breached:
         print(f"Thresholds Breached: {status.thresholds_breached}%")
@@ -87,15 +96,7 @@ def cmd_status(args):
 
 def cmd_test(args):
     """Test budget check with dry run."""
-    guardian = BudgetGuardian(
-        regions=args.regions.split(","),
-        total_budget=Decimal(args.budget),
-        alert_thresholds=[50, 75, 90],
-        auto_stop_threshold=100,
-        lambda_lookback_hours=args.lambda_lookback,
-        lambda_spike_threshold=args.spike_threshold,
-        lambda_spike_window_minutes=args.spike_window,
-    )
+    guardian = _create_guardian(args)
 
     print("Testing budget guardian (dry run)")
     print(f"Regions: {guardian.regions}")
@@ -108,10 +109,7 @@ def cmd_test(args):
     print(f"Actual Spend: ${status.actual_spend:.2f}")
     print(f"Projected Total: ${status.projected_total:.2f}")
     print(f"Budget Used: {status.budget_percent:.1f}%")
-    if status.actual_exceeded:
-        print(f"Action: {status.action} (immediate - actual spend exceeded)")
-    else:
-        print(f"Action: {status.action}")
+    print(f"Action: {_format_action(status)}")
     print()
 
     if status.action == "stop_all":
@@ -133,10 +131,7 @@ def cmd_stop(args):
         print("Use --confirm to proceed.")
         return 1
 
-    guardian = BudgetGuardian(
-        regions=args.regions.split(","),
-        total_budget=Decimal("0"),  # Not needed for stop
-    )
+    guardian = _create_guardian(args, budget=Decimal("0"))
 
     print(f"Discovering resources in: {guardian.regions}")
     status = guardian.check_budget()

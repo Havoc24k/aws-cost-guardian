@@ -89,6 +89,7 @@ class BudgetGuardian:
         self.ce = boto3.client("ce", region_name="us-east-1")
         self.sns = boto3.client("sns") if sns_topic_arn else None
         self._account_info: Optional[dict[str, str]] = None
+        self._pricing_client: Optional[Any] = None
 
     @classmethod
     def from_env(cls) -> "BudgetGuardian":
@@ -261,7 +262,23 @@ class BudgetGuardian:
 
         return resources
 
-    def _calculate_hourly_cost(self, resources: dict) -> Decimal:
+    def _get_pricing_client(self) -> Any:
+        """Get cached Pricing API client (always us-east-1)."""
+        if self._pricing_client is None:
+            self._pricing_client = boto3.client("pricing", region_name="us-east-1")
+        return self._pricing_client
+
+    def _extract_price_from_response(self, response: dict) -> Optional[Decimal]:
+        """Extract price from AWS Pricing API response."""
+        if response.get("PriceList"):
+            price_data = json.loads(response["PriceList"][0])
+            terms = price_data.get("terms", {}).get("OnDemand", {})
+            for term in terms.values():
+                for price_dim in term.get("priceDimensions", {}).values():
+                    return Decimal(price_dim["pricePerUnit"]["USD"])
+        return None
+
+    def _calculate_hourly_cost(self, resources: dict[str, list[dict[str, Any]]]) -> Decimal:
         """Calculate total hourly cost of running resources."""
         total = Decimal("0")
 
@@ -285,37 +302,21 @@ class BudgetGuardian:
     def _get_ec2_hourly_cost(self, instance_type: str, region: str) -> Decimal:
         """Get EC2 hourly cost. Uses fallback if Pricing API fails."""
         try:
-            pricing = boto3.client("pricing", region_name="us-east-1")
-            response = pricing.get_products(
+            response = self._get_pricing_client().get_products(
                 ServiceCode="AmazonEC2",
                 Filters=[
-                    {
-                        "Type": "TERM_MATCH",
-                        "Field": "instanceType",
-                        "Value": instance_type,
-                    },
-                    {
-                        "Type": "TERM_MATCH",
-                        "Field": "location",
-                        "Value": self._region_to_location(region),
-                    },
-                    {
-                        "Type": "TERM_MATCH",
-                        "Field": "operatingSystem",
-                        "Value": "Linux",
-                    },
+                    {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_type},
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": self._region_to_location(region)},
+                    {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
                     {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
                     {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
                     {"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"},
                 ],
                 MaxResults=1,
             )
-            if response["PriceList"]:
-                price_data = json.loads(response["PriceList"][0])
-                terms = price_data["terms"]["OnDemand"]
-                for term in terms.values():
-                    for price_dim in term["priceDimensions"].values():
-                        return Decimal(price_dim["pricePerUnit"]["USD"])
+            price = self._extract_price_from_response(response)
+            if price is not None:
+                return price
         except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
             print(f"Pricing API error for EC2 {instance_type}: {e}")
 
@@ -324,30 +325,18 @@ class BudgetGuardian:
     def _get_rds_hourly_cost(self, instance_class: str, engine: str, region: str) -> Decimal:
         """Get RDS hourly cost. Uses fallback if Pricing API fails."""
         try:
-            pricing = boto3.client("pricing", region_name="us-east-1")
-            response = pricing.get_products(
+            response = self._get_pricing_client().get_products(
                 ServiceCode="AmazonRDS",
                 Filters=[
-                    {
-                        "Type": "TERM_MATCH",
-                        "Field": "instanceType",
-                        "Value": instance_class,
-                    },
-                    {
-                        "Type": "TERM_MATCH",
-                        "Field": "location",
-                        "Value": self._region_to_location(region),
-                    },
+                    {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_class},
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": self._region_to_location(region)},
                     {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine},
                 ],
                 MaxResults=1,
             )
-            if response["PriceList"]:
-                price_data = json.loads(response["PriceList"][0])
-                terms = price_data["terms"]["OnDemand"]
-                for term in terms.values():
-                    for price_dim in term["priceDimensions"].values():
-                        return Decimal(price_dim["pricePerUnit"]["USD"])
+            price = self._extract_price_from_response(response)
+            if price is not None:
+                return price
         except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
             print(f"Pricing API error for RDS {instance_class}: {e}")
 
@@ -566,7 +555,8 @@ class BudgetGuardian:
             print(f"Spike detection error for Lambda {function_name}: {e}")
             return None
 
-    def _region_to_location(self, region: str) -> str:
+    @staticmethod
+    def _region_to_location(region: str) -> str:
         """Convert AWS region code to Pricing API location name."""
         locations = {
             "us-east-1": "US East (N. Virginia)",
