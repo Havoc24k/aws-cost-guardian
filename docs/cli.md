@@ -14,7 +14,7 @@ uv run python cli.py --budget 1000 --regions eu-central-1 status
 # Projected Total:       $50.23
 # Budget:                $1000.00
 # Budget Used:           5.0%
-# Hours Until Month End: 679
+# Hours Until Period End: 679
 #
 # Running Resources
 # ----------------------------------------
@@ -89,7 +89,7 @@ uv run python cli.py --budget 10 --regions eu-central-1 status
 # Budget:                $1000.00
 # Budget Used:           280.4%
 # STATUS:                ACTUAL SPEND EXCEEDED
-# Hours Until Month End: 638
+# Hours Until Period End: 638
 #
 # Running Resources
 # ----------------------------------------
@@ -110,6 +110,23 @@ uv run python cli.py --regions eu-central-1 stop --dry-run
 uv run python cli.py --regions eu-central-1 stop --confirm
 ```
 
+## Budget Period
+
+Use explicit dates to define a custom budget period:
+
+```bash
+# 35-day budget period
+uv run python cli.py --budget 1000 \
+  --budget-period-start 2026-01-01 \
+  --budget-period-end 2026-02-04 \
+  status
+
+# Output shows hours until period end:
+# Hours Until Period End: 625
+```
+
+If not specified, the budget period defaults to the current calendar month.
+
 ## Parameters
 
 | Parameter | Default | Description |
@@ -119,3 +136,5 @@ uv run python cli.py --regions eu-central-1 stop --confirm
 | `--lambda-lookback` | 24 | Hours for Lambda cost projection |
 | `--spike-threshold` | 10 | Alert if rate exceeds Nx baseline |
 | `--spike-window` | 5 | Minutes to check for spikes |
+| `--budget-period-start` | (none) | Budget period start (YYYY-MM-DD) |
+| `--budget-period-end` | (none) | Budget period end (YYYY-MM-DD) |

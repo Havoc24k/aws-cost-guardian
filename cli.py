@@ -21,6 +21,8 @@ def _create_guardian(args, budget: Decimal | None = None) -> BudgetGuardian:
         lambda_lookback_hours=getattr(args, "lambda_lookback", 24),
         lambda_spike_threshold=getattr(args, "spike_threshold", 10),
         lambda_spike_window_minutes=getattr(args, "spike_window", 5),
+        budget_period_start=getattr(args, "budget_period_start", ""),
+        budget_period_end=getattr(args, "budget_period_end", ""),
     )
 
 
@@ -50,7 +52,7 @@ def cmd_status(args):
     print(f"Budget Used:           {status.budget_percent:.1f}%")
     if status.actual_exceeded:
         print("STATUS:                ACTUAL SPEND EXCEEDED")
-    print(f"Hours Until Month End: {status.remaining_hours}")
+    print(f"Hours Until Period End: {status.remaining_hours}")
     print()
     print("Running Resources")
     print("-" * 40)
@@ -184,6 +186,18 @@ def main():
         type=int,
         default=5,
         help="Minutes to check for spike detection (default: 5)",
+    )
+    parser.add_argument(
+        "--budget-period-start",
+        type=str,
+        default="",
+        help="Budget period start date (YYYY-MM-DD). Defaults to 1st of current month.",
+    )
+    parser.add_argument(
+        "--budget-period-end",
+        type=str,
+        default="",
+        help="Budget period end date (YYYY-MM-DD). Defaults to last day of current month.",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")

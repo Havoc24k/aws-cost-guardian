@@ -27,6 +27,9 @@ module "cost_guardian" {
 | `auto_stop_threshold` | No | `100` | Stop at this percentage |
 | `check_interval` | No | `rate(1 hour)` | Check frequency |
 | `lambda_spike_threshold` | No | `10` | Alert if Lambda rate >= Nx baseline |
+| `budget_period_start` | No | `""` | Budget period start (YYYY-MM-DD) |
+| `budget_period_end` | No | `""` | Budget period end (YYYY-MM-DD) |
+| `dry_run` | No | `true` | Report actions without executing |
 
 ### Outputs
 

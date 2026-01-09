@@ -57,6 +57,9 @@ terraform apply
 | `lambda_spike_threshold` | `10` | Alert if rate exceeds Nx baseline |
 | `lambda_spike_window_minutes` | `5` | Minutes to check for spikes |
 | `lambda_baseline_hours` | `168` | Baseline period for comparison |
+| `budget_period_start` | `""` | Budget period start date (YYYY-MM-DD) |
+| `budget_period_end` | `""` | Budget period end date (YYYY-MM-DD) |
+| `dry_run` | `true` | Report actions without executing them |
 
 ## Variable Definitions
 
@@ -101,6 +104,24 @@ variable "lambda_spike_window_minutes" {
   type        = number
   default     = 5
 }
+
+variable "budget_period_start" {
+  description = "Budget period start date (YYYY-MM-DD)"
+  type        = string
+  default     = ""
+}
+
+variable "budget_period_end" {
+  description = "Budget period end date (YYYY-MM-DD)"
+  type        = string
+  default     = ""
+}
+
+variable "dry_run" {
+  description = "Report actions without executing them"
+  type        = bool
+  default     = true
+}
 ```
 
 ## Example: POC Account with Spike Detection
@@ -115,6 +136,20 @@ auto_stop_threshold       = 100
 lambda_spike_threshold    = 5    # Alert on 5x spike
 lambda_spike_window_minutes = 1  # Check every minute
 ```
+
+## Example: Custom Budget Period
+
+Use explicit start/end dates for non-monthly budget periods:
+
+```hcl
+# terraform.tfvars - 35-day budget period
+total_budget          = 1000
+alert_email           = "team@example.com"
+budget_period_start   = "2026-01-01"
+budget_period_end     = "2026-02-04"
+```
+
+If `budget_period_start` and `budget_period_end` are not set, the budget defaults to the current calendar month.
 
 ## Lambda Environment Variables
 
@@ -131,6 +166,9 @@ These are set automatically by Terraform in the Lambda function:
 | `LAMBDA_SPIKE_THRESHOLD` | from var | Spike alert multiplier |
 | `LAMBDA_SPIKE_WINDOW_MINUTES` | from var | Spike detection window |
 | `LAMBDA_BASELINE_HOURS` | 168 | Baseline period (7 days) |
+| `BUDGET_PERIOD_START` | from var | Budget period start (YYYY-MM-DD) |
+| `BUDGET_PERIOD_END` | from var | Budget period end (YYYY-MM-DD) |
+| `DRY_RUN` | from var | Dry run mode (true/false) |
 
 ## Cleanup
 

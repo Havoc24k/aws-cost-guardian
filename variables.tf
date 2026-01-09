@@ -75,3 +75,15 @@ variable "dry_run" {
   type        = bool
   default     = true
 }
+
+variable "budget_period_start" {
+  description = "Budget period start date (YYYY-MM-DD). Defaults to 1st of current month if not set."
+  type        = string
+  default     = ""
+}
+
+variable "budget_period_end" {
+  description = "Budget period end date (YYYY-MM-DD). Defaults to last day of current month if not set."
+  type        = string
+  default     = ""
+}

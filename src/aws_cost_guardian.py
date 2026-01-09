@@ -73,6 +73,8 @@ class BudgetGuardian:
         lambda_spike_window_minutes: int = DEFAULT_LAMBDA_SPIKE_WINDOW_MINUTES,
         lambda_baseline_hours: int = DEFAULT_LAMBDA_BASELINE_HOURS,
         exclude_lambdas: Optional[list[str]] = None,
+        budget_period_start: str = "",
+        budget_period_end: str = "",
     ):
         self.regions = regions
         self.budget = Decimal(str(total_budget))
@@ -84,6 +86,8 @@ class BudgetGuardian:
         self.lambda_spike_window_minutes = lambda_spike_window_minutes
         self.lambda_baseline_hours = lambda_baseline_hours
         self.exclude_lambdas = set(exclude_lambdas or [])
+        self.budget_period_start = budget_period_start
+        self.budget_period_end = budget_period_end
 
         # Clients (Cost Explorer is global, others are regional)
         self.ce = boto3.client("ce", region_name="us-east-1")
@@ -111,6 +115,8 @@ class BudgetGuardian:
             lambda_spike_window_minutes=int(os.environ.get("LAMBDA_SPIKE_WINDOW_MINUTES", "5")),
             lambda_baseline_hours=int(os.environ.get("LAMBDA_BASELINE_HOURS", "168")),
             exclude_lambdas=exclude,
+            budget_period_start=os.environ.get("BUDGET_PERIOD_START", ""),
+            budget_period_end=os.environ.get("BUDGET_PERIOD_END", ""),
         )
 
     def check_budget(self) -> BudgetStatus:
@@ -124,8 +130,8 @@ class BudgetGuardian:
         # 3. Calculate hourly cost of running resources
         hourly_cost = self._calculate_hourly_cost(resources)
 
-        # 4. Project to end of month
-        remaining_hours = self._hours_until_month_end()
+        # 4. Project to end of budget period
+        remaining_hours = self._hours_until_period_end()
         projected_additional = hourly_cost * remaining_hours
         projected_total = actual_spend + projected_additional
 
@@ -157,23 +163,27 @@ class BudgetGuardian:
         )
 
     def _get_actual_spend(self) -> Decimal:
-        """Get total account spend from Cost Explorer (up to 13 months history).
+        """Get actual spend for the current budget period from Cost Explorer.
 
         See: https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html
         """
+        period_start, _ = self._get_period_bounds()
         now = datetime.now(timezone.utc)
+
+        start = period_start.strftime("%Y-%m-%d")
         end = now.strftime("%Y-%m-%d")
-        # Cost Explorer supports up to 13 months of historical data
-        # Ref: https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html
-        start = (now - timedelta(days=395)).strftime("%Y-%m-%d")
+
+        # Ensure start is not before end (can happen on first day of period)
+        if start >= end:
+            return Decimal("0")
 
         try:
             response = self.ce.get_cost_and_usage(
                 TimePeriod={"Start": start, "End": end},
-                Granularity="MONTHLY",
+                Granularity="DAILY",
                 Metrics=["UnblendedCost"],
             )
-            # Sum all months
+            # Sum all days in the period
             total_cost = Decimal("0")
             for result in response.get("ResultsByTime", []):
                 total = result.get("Total", {})
@@ -573,12 +583,35 @@ class BudgetGuardian:
         }
         return locations.get(region, "US East (N. Virginia)")
 
-    def _hours_until_month_end(self) -> int:
-        """Calculate remaining hours in current month."""
+    def _get_period_bounds(self) -> tuple[datetime, datetime]:
+        """Get start and end of budget period.
+
+        If budget_period_start and budget_period_end are set, parse them.
+        Otherwise, default to current month (1st to last day).
+        """
         now = datetime.now(timezone.utc)
-        days_in_month = monthrange(now.year, now.month)[1]
-        end_of_month = now.replace(day=days_in_month, hour=23, minute=59, second=59)
-        remaining = end_of_month - now
+
+        if self.budget_period_start and self.budget_period_end:
+            # Parse explicit dates (YYYY-MM-DD format)
+            start = datetime.strptime(self.budget_period_start, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+            end = datetime.strptime(self.budget_period_end, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, tzinfo=timezone.utc
+            )
+        else:
+            # Default: current month
+            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            days_in_month = monthrange(now.year, now.month)[1]
+            end = now.replace(day=days_in_month, hour=23, minute=59, second=59)
+
+        return start, end
+
+    def _hours_until_period_end(self) -> int:
+        """Calculate remaining hours in current budget period."""
+        now = datetime.now(timezone.utc)
+        _, period_end = self._get_period_bounds()
+        remaining = period_end - now
         return max(0, int(remaining.total_seconds() / 3600))
 
     def _determine_action(

@@ -175,6 +175,8 @@ resource "aws_lambda_function" "guardian" {
       LAMBDA_SPIKE_THRESHOLD      = tostring(var.lambda_spike_threshold)
       LAMBDA_SPIKE_WINDOW_MINUTES = tostring(var.lambda_spike_window_minutes)
       LAMBDA_BASELINE_HOURS       = tostring(var.lambda_baseline_hours)
+      BUDGET_PERIOD_START         = var.budget_period_start
+      BUDGET_PERIOD_END           = var.budget_period_end
     }
   }
 
