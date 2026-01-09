@@ -39,8 +39,6 @@ module "cost_guardian" {
 | `lambda_function_arn` | ARN of the Lambda function |
 | `sns_topic_arn` | ARN of the SNS topic |
 
-See [examples/](examples/) for complete usage examples.
-
 **Note:** If deploying to an account where total spend already exceeds the budget,
 resources will be stopped immediately on first run.
 
@@ -77,8 +75,6 @@ versions.tf           # Provider requirements
 src/                  # Lambda code
   aws_cost_guardian.py
   lambda_handler.py
-examples/             # Usage examples
-  basic/
 cli.py                # Local CLI for testing
 docs/                 # Documentation
 ```
