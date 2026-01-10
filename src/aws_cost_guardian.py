@@ -17,6 +17,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 # Default hourly costs when Pricing API fails
 DEFAULT_EC2_HOURLY = Decimal("0.10")
 DEFAULT_RDS_HOURLY = Decimal("0.15")
+DEFAULT_APPRUNNER_HOURLY = Decimal("0.10")
 
 # Lambda pricing constants
 LAMBDA_PRICE_PER_REQUEST = Decimal("0.0000002")  # $0.20 per 1M requests
@@ -202,6 +203,7 @@ class BudgetGuardian:
             "ec2": [],
             "rds": [],
             "lambda": [],
+            "apprunner": [],
         }
 
         for region in self.regions:
@@ -271,6 +273,30 @@ class BudgetGuardian:
             except (KeyError, AttributeError, BotoCoreError, ClientError) as e:
                 print(f"Lambda discovery error in {region}: {e}")
 
+            # App Runner (no paginator available, use NextToken manually)
+            apprunner = boto3.client("apprunner", region_name=region)
+            try:
+                next_token = None
+                while True:
+                    if next_token:
+                        response = apprunner.list_services(NextToken=next_token)
+                    else:
+                        response = apprunner.list_services()
+                    for svc in response.get("ServiceSummaryList", []):
+                        if svc.get("Status") == "RUNNING":
+                            resources["apprunner"].append(
+                                {
+                                    "name": svc.get("ServiceName"),
+                                    "arn": svc.get("ServiceArn"),
+                                    "region": region,
+                                }
+                            )
+                    next_token = response.get("NextToken")
+                    if not next_token:
+                        break
+            except (KeyError, AttributeError, BotoCoreError, ClientError) as e:
+                print(f"AppRunner discovery error in {region}: {e}")
+
         return resources
 
     def _get_pricing_client(self) -> Any:
@@ -306,6 +332,11 @@ class BudgetGuardian:
         # Lambda functions (based on recent usage)
         for func in resources["lambda"]:
             cost = self._get_lambda_hourly_cost(func["name"], func["region"], func["memory_mb"])
+            total += cost
+
+        # App Runner services
+        for svc in resources["apprunner"]:
+            cost = self._get_apprunner_hourly_cost(svc["arn"], svc["region"])
             total += cost
 
         return total
@@ -424,6 +455,32 @@ class BudgetGuardian:
         except (BotoCoreError, ClientError) as e:
             print(f"CloudWatch error for Lambda {function_name}: {e}")
             return Decimal("0")
+
+    def _get_apprunner_hourly_cost(self, service_arn: str, region: str) -> Decimal:
+        """Get App Runner hourly cost based on configuration.
+
+        App Runner pricing (provisioned):
+        - $0.064 per vCPU-hour
+        - $0.007 per GB-hour (memory)
+        """
+        try:
+            apprunner = boto3.client("apprunner", region_name=region)
+            response = apprunner.describe_service(ServiceArn=service_arn)
+            config = response["Service"]["InstanceConfiguration"]
+
+            # Cpu is in millicores (e.g., "1024" = 1 vCPU)
+            cpu = Decimal(config.get("Cpu", "1024")) / 1024
+            # Memory is in MB (e.g., "2048" = 2 GB)
+            memory = Decimal(config.get("Memory", "2048")) / 1024
+
+            # Pricing: $0.064/vCPU-hour + $0.007/GB-hour
+            cpu_cost = cpu * Decimal("0.064")
+            memory_cost = memory * Decimal("0.007")
+
+            return cpu_cost + memory_cost
+        except (BotoCoreError, ClientError) as e:
+            print(f"AppRunner pricing error for {service_arn}: {e}")
+            return DEFAULT_APPRUNNER_HOURLY
 
     def _detect_lambda_spikes(self, resources: dict) -> list[LambdaSpike]:
         """
@@ -636,7 +693,12 @@ class BudgetGuardian:
         self, resources: dict[str, Any], dry_run: bool = False
     ) -> dict[str, list[dict[str, Any]]]:
         """Stop all running resources."""
-        results: dict[str, list[dict[str, Any]]] = {"ec2": [], "rds": [], "lambda": []}
+        results: dict[str, list[dict[str, Any]]] = {
+            "ec2": [],
+            "rds": [],
+            "lambda": [],
+            "apprunner": [],
+        }
 
         # Stop EC2 instances
         for instance in resources["ec2"]:
@@ -692,6 +754,23 @@ class BudgetGuardian:
                 )
             except (BotoCoreError, ClientError) as e:
                 results["lambda"].append({"name": func["name"], "status": "error", "error": str(e)})
+
+        # Pause App Runner services
+        for svc in resources["apprunner"]:
+            try:
+                apprunner = boto3.client("apprunner", region_name=svc["region"])
+                if not dry_run:
+                    apprunner.pause_service(ServiceArn=svc["arn"])
+                results["apprunner"].append(
+                    {
+                        "name": svc["name"],
+                        "status": "paused" if not dry_run else "dry_run",
+                    }
+                )
+            except (BotoCoreError, ClientError) as e:
+                results["apprunner"].append(
+                    {"name": svc["name"], "status": "error", "error": str(e)}
+                )
 
         return results
 
@@ -787,6 +866,7 @@ Running Resources:
 - EC2 Instances: {len(status.resources["ec2"])}
 - RDS Instances: {len(status.resources["rds"])}
 - Lambda Functions: {len(status.resources["lambda"])}
+- App Runner Services: {len(status.resources["apprunner"])}
 
 Hourly Cost: ${status.hourly_cost:.2f}
 Hours Until Period End: {status.remaining_hours}
@@ -800,6 +880,7 @@ Remediation Executed:
 - EC2 Stopped: {len([r for r in stop_results["ec2"] if r["status"] == "stopped"])}
 - RDS Stopped: {len([r for r in stop_results["rds"] if r["status"] == "stopped"])}
 - Lambda Throttled: {len([r for r in stop_results["lambda"] if r["status"] == "throttled"])}
+- App Runner Paused: {len([r for r in stop_results["apprunner"] if r["status"] == "paused"])}
 """
 
         try:
@@ -825,6 +906,9 @@ Remediation Executed:
                 + len([r for r in stop_results["rds"] if r["status"] in ("stopped", "dry_run")])
                 + len(
                     [r for r in stop_results["lambda"] if r["status"] in ("throttled", "dry_run")]
+                )
+                + len(
+                    [r for r in stop_results["apprunner"] if r["status"] in ("paused", "dry_run")]
                 )
             )
             if actually_changed > 0:
