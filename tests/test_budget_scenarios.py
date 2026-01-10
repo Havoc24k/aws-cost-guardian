@@ -398,3 +398,148 @@ class TestBudgetPeriod:
         # 800 + (10 * 10) = $900 = 90%
         assert status.action == "alert"
         assert 90 <= status.budget_percent < 100
+
+
+class TestAppRunner:
+    """Test App Runner resource discovery and pausing."""
+
+    @patch("boto3.client")
+    def test_discover_apprunner_services(self, mock_boto):
+        """Test that running App Runner services are discovered."""
+        # Mock clients for different services
+        mock_clients = {}
+
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        # Set up AppRunner mock (uses list_services directly, no paginator)
+        mock_apprunner = mock_clients.setdefault("apprunner", MagicMock())
+        mock_apprunner.list_services.return_value = {
+            "ServiceSummaryList": [
+                {
+                    "ServiceName": "my-app",
+                    "ServiceArn": "arn:aws:apprunner:us-east-1:123456789012:service/my-app/abc123",
+                    "Status": "RUNNING",
+                },
+                {
+                    "ServiceName": "paused-app",
+                    "ServiceArn": "arn:aws:apprunner:us-east-1:123456789012:service/paused-app/def456",
+                    "Status": "PAUSED",  # Should be excluded
+                },
+            ]
+        }
+
+        # Set up empty mocks for other services
+        for svc in ["ec2", "rds", "lambda"]:
+            mock_svc = mock_clients.setdefault(svc, MagicMock())
+            mock_paginator = MagicMock()
+            mock_svc.get_paginator.return_value = mock_paginator
+            mock_paginator.paginate.return_value = [
+                {"Reservations": [], "DBInstances": [], "Functions": []}
+            ]
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+        resources = guardian._discover_resources()
+
+        # Only RUNNING services should be discovered
+        assert len(resources["apprunner"]) == 1
+        assert resources["apprunner"][0]["name"] == "my-app"
+        assert "arn" in resources["apprunner"][0]
+
+    @patch("boto3.client")
+    def test_apprunner_hourly_cost_calculation(self, mock_boto):
+        """Test App Runner cost calculation from instance config."""
+        mock_apprunner = MagicMock()
+        mock_boto.return_value = mock_apprunner
+
+        # 1 vCPU (1024 millicores), 2 GB memory
+        mock_apprunner.describe_service.return_value = {
+            "Service": {
+                "InstanceConfiguration": {
+                    "Cpu": "1024",
+                    "Memory": "2048",
+                }
+            }
+        }
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+        cost = guardian._get_apprunner_hourly_cost(
+            "arn:aws:apprunner:us-east-1:123456789012:service/test/abc",
+            "us-east-1",
+        )
+
+        # Expected: 1 vCPU * $0.064 + 2 GB * $0.007 = $0.064 + $0.014 = $0.078
+        assert cost == Decimal("0.078")
+
+    @patch("boto3.client")
+    def test_pause_apprunner_service(self, mock_boto):
+        """Test pausing App Runner services."""
+        mock_apprunner = MagicMock()
+        mock_boto.return_value = mock_apprunner
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+
+        resources = {
+            "ec2": [],
+            "rds": [],
+            "lambda": [],
+            "apprunner": [
+                {
+                    "name": "my-app",
+                    "arn": "arn:aws:apprunner:us-east-1:123456789012:service/my-app/abc123",
+                    "region": "us-east-1",
+                }
+            ],
+        }
+
+        results = guardian.stop_all_resources(resources, dry_run=False)
+
+        # Verify pause_service was called
+        mock_apprunner.pause_service.assert_called_once_with(
+            ServiceArn="arn:aws:apprunner:us-east-1:123456789012:service/my-app/abc123"
+        )
+        assert len(results["apprunner"]) == 1
+        assert results["apprunner"][0]["status"] == "paused"
+
+    @patch("boto3.client")
+    def test_pause_apprunner_dry_run(self, mock_boto):
+        """Test dry run does not actually pause services."""
+        mock_apprunner = MagicMock()
+        mock_boto.return_value = mock_apprunner
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+
+        resources = {
+            "ec2": [],
+            "rds": [],
+            "lambda": [],
+            "apprunner": [
+                {
+                    "name": "my-app",
+                    "arn": "arn:aws:apprunner:us-east-1:123456789012:service/my-app/abc123",
+                    "region": "us-east-1",
+                }
+            ],
+        }
+
+        results = guardian.stop_all_resources(resources, dry_run=True)
+
+        # pause_service should NOT be called in dry run
+        mock_apprunner.pause_service.assert_not_called()
+        assert results["apprunner"][0]["status"] == "dry_run"
