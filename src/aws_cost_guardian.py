@@ -547,15 +547,53 @@ class BudgetGuardian:
             print(f"AppRunner pricing error for {service_arn}: {e}")
             return DEFAULT_APPRUNNER_HOURLY
 
+    def _get_fargate_unit_prices(self, region: str) -> tuple[Decimal, Decimal]:
+        """Get Fargate vCPU and memory hourly prices from Pricing API.
+
+        Returns (cpu_price_per_vcpu_hour, memory_price_per_gb_hour).
+        Falls back to default prices if API fails.
+        """
+        location = self._region_to_location(region)
+        cpu_price = None
+        memory_price = None
+
+        try:
+            # Query for Fargate vCPU pricing
+            cpu_response = self._get_pricing_client().get_products(
+                ServiceCode="AmazonECS",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "cputype", "Value": "perCPU"},
+                ],
+                MaxResults=1,
+            )
+            cpu_price = self._extract_price_from_response(cpu_response)
+
+            # Query for Fargate memory pricing
+            memory_response = self._get_pricing_client().get_products(
+                ServiceCode="AmazonECS",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "memorytype", "Value": "perGB"},
+                ],
+                MaxResults=1,
+            )
+            memory_price = self._extract_price_from_response(memory_response)
+        except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
+            print(f"Pricing API error for Fargate in {region}: {e}")
+
+        # Use defaults if API fails
+        return (
+            cpu_price if cpu_price is not None else Decimal("0.04048"),
+            memory_price if memory_price is not None else Decimal("0.004445"),
+        )
+
     def _get_ecs_hourly_cost(
         self, task_definition: str, running_count: int, region: str
     ) -> Decimal:
         """Get ECS Fargate hourly cost based on task definition.
 
-        Fargate pricing:
-        - $0.04048 per vCPU per hour
-        - $0.004445 per GB per hour (memory)
-
+        Uses Pricing API for vCPU and memory rates with fallback to defaults.
         Cost is multiplied by running_count (number of tasks).
         """
         try:
@@ -572,9 +610,11 @@ class BudgetGuardian:
             memory_mb = int(task_def.get("memory", "512"))
             memory = Decimal(memory_mb) / 1024
 
-            # Pricing: $0.04048/vCPU-hour + $0.004445/GB-hour
-            cpu_cost = cpu * Decimal("0.04048")
-            memory_cost = memory * Decimal("0.004445")
+            # Get prices from Pricing API (with fallback)
+            cpu_rate, memory_rate = self._get_fargate_unit_prices(region)
+
+            cpu_cost = cpu * cpu_rate
+            memory_cost = memory * memory_rate
 
             return (cpu_cost + memory_cost) * running_count
         except (BotoCoreError, ClientError) as e:

@@ -618,17 +618,51 @@ class TestECS:
 
     @patch("boto3.client")
     def test_ecs_hourly_cost_calculation(self, mock_boto):
-        """Test ECS Fargate cost calculation from task definition."""
-        mock_ecs = MagicMock()
-        mock_boto.return_value = mock_ecs
+        """Test ECS Fargate cost calculation from task definition with Pricing API."""
+        mock_clients = {}
 
-        # 1 vCPU (1024 units), 2 GB memory (2048 MB)
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        # Mock ECS describe_task_definition
+        mock_ecs = mock_clients.setdefault("ecs", MagicMock())
         mock_ecs.describe_task_definition.return_value = {
             "taskDefinition": {
-                "cpu": "1024",
-                "memory": "2048",
+                "cpu": "1024",  # 1 vCPU
+                "memory": "2048",  # 2 GB
             }
         }
+
+        # Mock Pricing API responses
+        mock_pricing = mock_clients.setdefault("pricing", MagicMock())
+
+        def mock_get_products(**kwargs):
+            filters = {f["Field"]: f["Value"] for f in kwargs.get("Filters", [])}
+            if "cputype" in filters:
+                # vCPU pricing
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.05"}}}}}}}'
+                    ]
+                }
+            elif "memorytype" in filters:
+                # Memory pricing
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.005"}}}}}}}'
+                    ]
+                }
+            return {"PriceList": []}
+
+        mock_pricing.get_products.side_effect = mock_get_products
+
+        # Mock SSM for region lookup
+        mock_ssm = mock_clients.setdefault("ssm", MagicMock())
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "US East (N. Virginia)"}}
 
         guardian = BudgetGuardian(
             regions=["us-east-1"],
@@ -640,9 +674,9 @@ class TestECS:
             region="us-east-1",
         )
 
-        # Expected per task: 1 vCPU * $0.04048 + 2 GB * $0.004445 = $0.04048 + $0.00889 = $0.04937
-        # With 2 tasks: $0.04937 * 2 = $0.09874
-        expected = (Decimal("0.04048") + Decimal("2") * Decimal("0.004445")) * 2
+        # Expected per task: 1 vCPU * $0.05 + 2 GB * $0.005 = $0.05 + $0.01 = $0.06
+        # With 2 tasks: $0.06 * 2 = $0.12
+        expected = (Decimal("0.05") + Decimal("2") * Decimal("0.005")) * 2
         assert cost == expected
 
     @patch("boto3.client")
