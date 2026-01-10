@@ -21,6 +21,8 @@ uv run python cli.py --budget 1000 --regions eu-central-1 status
 # EC2 Instances:         1
 # RDS Instances:         0
 # Lambda Functions:      2
+# App Runner Services:   0
+# ECS Fargate Services:  0
 #
 # Action: OK
 ```
@@ -96,6 +98,8 @@ uv run python cli.py --budget 10 --regions eu-central-1 status
 # EC2 Instances:         1
 # RDS Instances:         0
 # Lambda Functions:      2
+# App Runner Services:   0
+# ECS Fargate Services:  0
 #
 # Action: STOP_ALL (immediate - actual spend exceeded)
 ```

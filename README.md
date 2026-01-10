@@ -8,7 +8,7 @@ Use directly from GitHub:
 
 ```hcl
 module "cost_guardian" {
-  source = "github.com/Havoc24k/aws-cost-guardian?ref=v1.0.0"
+  source = "github.com/Havoc24k/aws-cost-guardian?ref=v1.0.2"
 
   total_budget = 1000
   alert_email  = "ops@example.com"

@@ -68,6 +68,8 @@ Monthly:       ~$1,950
 | EC2 | `stop_instances` |
 | RDS | `stop_db_instance` |
 | Lambda | `put_function_concurrency(0)` |
+| App Runner | `pause_service` |
+| ECS Fargate | `update_service(desiredCount=0)` |
 
 ## Alert Suppression
 
@@ -90,9 +92,18 @@ This prevents duplicate alerts on repeated runs when resources are already remed
     "lambda:ListFunctions",
     "lambda:GetFunctionConcurrency",
     "lambda:PutFunctionConcurrency",
+    "apprunner:ListServices",
+    "apprunner:DescribeService",
+    "apprunner:PauseService",
+    "ecs:ListClusters",
+    "ecs:ListServices",
+    "ecs:DescribeServices",
+    "ecs:DescribeTaskDefinition",
+    "ecs:UpdateService",
     "cloudwatch:GetMetricStatistics",
     "sns:Publish",
     "pricing:GetProducts",
+    "ssm:GetParameter",
     "sts:GetCallerIdentity",
     "iam:ListAccountAliases",
     "organizations:DescribeOrganization"
