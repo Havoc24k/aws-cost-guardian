@@ -521,12 +521,53 @@ class BudgetGuardian:
             print(f"CloudWatch error for Lambda {function_name}: {e}")
             return Decimal("0")
 
+    def _get_apprunner_unit_prices(self, region: str) -> tuple[Decimal, Decimal]:
+        """Get App Runner vCPU and memory hourly prices from Pricing API.
+
+        Returns (cpu_price_per_vcpu_hour, memory_price_per_gb_hour).
+        Falls back to default prices if API fails.
+        """
+        location = self._region_to_location(region)
+        cpu_price = None
+        memory_price = None
+
+        try:
+            # Query for App Runner vCPU pricing
+            cpu_response = self._get_pricing_client().get_products(
+                ServiceCode="AWSAppRunner",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "computeType", "Value": "Provisioned"},
+                    {"Type": "TERM_MATCH", "Field": "computeResource", "Value": "vCPU"},
+                ],
+                MaxResults=1,
+            )
+            cpu_price = self._extract_price_from_response(cpu_response)
+
+            # Query for App Runner memory pricing
+            memory_response = self._get_pricing_client().get_products(
+                ServiceCode="AWSAppRunner",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "computeType", "Value": "Provisioned"},
+                    {"Type": "TERM_MATCH", "Field": "computeResource", "Value": "Memory"},
+                ],
+                MaxResults=1,
+            )
+            memory_price = self._extract_price_from_response(memory_response)
+        except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
+            print(f"Pricing API error for App Runner in {region}: {e}")
+
+        # Use defaults if API fails
+        return (
+            cpu_price if cpu_price is not None else Decimal("0.064"),
+            memory_price if memory_price is not None else Decimal("0.007"),
+        )
+
     def _get_apprunner_hourly_cost(self, service_arn: str, region: str) -> Decimal:
         """Get App Runner hourly cost based on configuration.
 
-        App Runner pricing (provisioned):
-        - $0.064 per vCPU-hour
-        - $0.007 per GB-hour (memory)
+        Uses Pricing API for vCPU and memory rates with fallback to defaults.
         """
         try:
             apprunner = boto3.client("apprunner", region_name=region)
@@ -538,9 +579,11 @@ class BudgetGuardian:
             # Memory is in MB (e.g., "2048" = 2 GB)
             memory = Decimal(config.get("Memory", "2048")) / 1024
 
-            # Pricing: $0.064/vCPU-hour + $0.007/GB-hour
-            cpu_cost = cpu * Decimal("0.064")
-            memory_cost = memory * Decimal("0.007")
+            # Get prices from Pricing API (with fallback)
+            cpu_rate, memory_rate = self._get_apprunner_unit_prices(region)
+
+            cpu_cost = cpu * cpu_rate
+            memory_cost = memory * memory_rate
 
             return cpu_cost + memory_cost
         except (BotoCoreError, ClientError) as e:

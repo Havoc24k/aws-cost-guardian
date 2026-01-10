@@ -459,19 +459,51 @@ class TestAppRunner:
 
     @patch("boto3.client")
     def test_apprunner_hourly_cost_calculation(self, mock_boto):
-        """Test App Runner cost calculation from instance config."""
-        mock_apprunner = MagicMock()
-        mock_boto.return_value = mock_apprunner
+        """Test App Runner cost calculation from instance config with Pricing API."""
+        mock_clients = {}
 
-        # 1 vCPU (1024 millicores), 2 GB memory
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        # Mock App Runner describe_service
+        mock_apprunner = mock_clients.setdefault("apprunner", MagicMock())
         mock_apprunner.describe_service.return_value = {
             "Service": {
                 "InstanceConfiguration": {
-                    "Cpu": "1024",
-                    "Memory": "2048",
+                    "Cpu": "1024",  # 1 vCPU
+                    "Memory": "2048",  # 2 GB
                 }
             }
         }
+
+        # Mock Pricing API responses
+        mock_pricing = mock_clients.setdefault("pricing", MagicMock())
+
+        def mock_get_products(**kwargs):
+            filters = {f["Field"]: f["Value"] for f in kwargs.get("Filters", [])}
+            if filters.get("computeResource") == "vCPU":
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.07"}}}}}}}'
+                    ]
+                }
+            elif filters.get("computeResource") == "Memory":
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.008"}}}}}}}'
+                    ]
+                }
+            return {"PriceList": []}
+
+        mock_pricing.get_products.side_effect = mock_get_products
+
+        # Mock SSM for region lookup
+        mock_ssm = mock_clients.setdefault("ssm", MagicMock())
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "US East (N. Virginia)"}}
 
         guardian = BudgetGuardian(
             regions=["us-east-1"],
@@ -482,8 +514,9 @@ class TestAppRunner:
             "us-east-1",
         )
 
-        # Expected: 1 vCPU * $0.064 + 2 GB * $0.007 = $0.064 + $0.014 = $0.078
-        assert cost == Decimal("0.078")
+        # Expected: 1 vCPU * $0.07 + 2 GB * $0.008 = $0.07 + $0.016 = $0.086
+        expected = Decimal("0.07") + Decimal("2") * Decimal("0.008")
+        assert cost == expected
 
     @patch("boto3.client")
     def test_pause_apprunner_service(self, mock_boto):
