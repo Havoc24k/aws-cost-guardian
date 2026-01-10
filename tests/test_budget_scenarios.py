@@ -442,6 +442,10 @@ class TestAppRunner:
                 {"Reservations": [], "DBInstances": [], "Functions": []}
             ]
 
+        # Set up empty ECS mock
+        mock_ecs = mock_clients.setdefault("ecs", MagicMock())
+        mock_ecs.list_clusters.return_value = {"clusterArns": []}
+
         guardian = BudgetGuardian(
             regions=["us-east-1"],
             total_budget=Decimal("1000"),
@@ -503,6 +507,7 @@ class TestAppRunner:
                     "region": "us-east-1",
                 }
             ],
+            "ecs": [],
         }
 
         results = guardian.stop_all_resources(resources, dry_run=False)
@@ -536,6 +541,7 @@ class TestAppRunner:
                     "region": "us-east-1",
                 }
             ],
+            "ecs": [],
         }
 
         results = guardian.stop_all_resources(resources, dry_run=True)
@@ -543,3 +549,171 @@ class TestAppRunner:
         # pause_service should NOT be called in dry run
         mock_apprunner.pause_service.assert_not_called()
         assert results["apprunner"][0]["status"] == "dry_run"
+
+
+class TestECS:
+    """Test ECS Fargate resource discovery and scaling down."""
+
+    @patch("boto3.client")
+    def test_discover_ecs_fargate_services(self, mock_boto):
+        """Test that running ECS Fargate services are discovered."""
+        mock_clients = {}
+
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        # Set up ECS mock
+        mock_ecs = mock_clients.setdefault("ecs", MagicMock())
+        mock_ecs.list_clusters.return_value = {
+            "clusterArns": ["arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster"]
+        }
+        mock_ecs.list_services.return_value = {
+            "serviceArns": ["arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service"]
+        }
+        mock_ecs.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "my-service",
+                    "serviceArn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service",
+                    "runningCount": 2,
+                    "launchType": "FARGATE",
+                    "taskDefinition": "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+                },
+                {
+                    "serviceName": "ec2-service",
+                    "serviceArn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/ec2-service",
+                    "runningCount": 1,
+                    "launchType": "EC2",  # Should be excluded
+                    "taskDefinition": "arn:aws:ecs:us-east-1:123456789012:task-definition/ec2-task:1",
+                },
+            ]
+        }
+
+        # Set up empty mocks for other services
+        for svc in ["ec2", "rds", "lambda", "apprunner"]:
+            mock_svc = mock_clients.setdefault(svc, MagicMock())
+            if svc == "apprunner":
+                mock_svc.list_services.return_value = {"ServiceSummaryList": []}
+            else:
+                mock_paginator = MagicMock()
+                mock_svc.get_paginator.return_value = mock_paginator
+                mock_paginator.paginate.return_value = [
+                    {"Reservations": [], "DBInstances": [], "Functions": []}
+                ]
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+        resources = guardian._discover_resources()
+
+        # Only FARGATE services with running tasks should be discovered
+        assert len(resources["ecs"]) == 1
+        assert resources["ecs"][0]["name"] == "my-service"
+        assert resources["ecs"][0]["running_count"] == 2
+
+    @patch("boto3.client")
+    def test_ecs_hourly_cost_calculation(self, mock_boto):
+        """Test ECS Fargate cost calculation from task definition."""
+        mock_ecs = MagicMock()
+        mock_boto.return_value = mock_ecs
+
+        # 1 vCPU (1024 units), 2 GB memory (2048 MB)
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {
+                "cpu": "1024",
+                "memory": "2048",
+            }
+        }
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+        cost = guardian._get_ecs_hourly_cost(
+            "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+            running_count=2,
+            region="us-east-1",
+        )
+
+        # Expected per task: 1 vCPU * $0.04048 + 2 GB * $0.004445 = $0.04048 + $0.00889 = $0.04937
+        # With 2 tasks: $0.04937 * 2 = $0.09874
+        expected = (Decimal("0.04048") + Decimal("2") * Decimal("0.004445")) * 2
+        assert cost == expected
+
+    @patch("boto3.client")
+    def test_scale_down_ecs_service(self, mock_boto):
+        """Test scaling down ECS services."""
+        mock_ecs = MagicMock()
+        mock_boto.return_value = mock_ecs
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+
+        resources = {
+            "ec2": [],
+            "rds": [],
+            "lambda": [],
+            "apprunner": [],
+            "ecs": [
+                {
+                    "name": "my-service",
+                    "arn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service",
+                    "cluster": "arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster",
+                    "region": "us-east-1",
+                    "running_count": 2,
+                    "task_definition": "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+                }
+            ],
+        }
+
+        results = guardian.stop_all_resources(resources, dry_run=False)
+
+        # Verify update_service was called with desiredCount=0
+        mock_ecs.update_service.assert_called_once_with(
+            cluster="arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster",
+            service="my-service",
+            desiredCount=0,
+        )
+        assert len(results["ecs"]) == 1
+        assert results["ecs"][0]["status"] == "scaled_down"
+
+    @patch("boto3.client")
+    def test_scale_down_ecs_dry_run(self, mock_boto):
+        """Test dry run does not actually scale down services."""
+        mock_ecs = MagicMock()
+        mock_boto.return_value = mock_ecs
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+
+        resources = {
+            "ec2": [],
+            "rds": [],
+            "lambda": [],
+            "apprunner": [],
+            "ecs": [
+                {
+                    "name": "my-service",
+                    "arn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service",
+                    "cluster": "arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster",
+                    "region": "us-east-1",
+                    "running_count": 2,
+                    "task_definition": "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+                }
+            ],
+        }
+
+        results = guardian.stop_all_resources(resources, dry_run=True)
+
+        # update_service should NOT be called in dry run
+        mock_ecs.update_service.assert_not_called()
+        assert results["ecs"][0]["status"] == "dry_run"
