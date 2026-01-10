@@ -18,6 +18,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 DEFAULT_EC2_HOURLY = Decimal("0.10")
 DEFAULT_RDS_HOURLY = Decimal("0.15")
 DEFAULT_APPRUNNER_HOURLY = Decimal("0.10")
+DEFAULT_ECS_FARGATE_HOURLY = Decimal("0.05")
 
 # Lambda pricing constants
 LAMBDA_PRICE_PER_REQUEST = Decimal("0.0000002")  # $0.20 per 1M requests
@@ -204,6 +205,7 @@ class BudgetGuardian:
             "rds": [],
             "lambda": [],
             "apprunner": [],
+            "ecs": [],
         }
 
         for region in self.regions:
@@ -297,6 +299,62 @@ class BudgetGuardian:
             except (KeyError, AttributeError, BotoCoreError, ClientError) as e:
                 print(f"AppRunner discovery error in {region}: {e}")
 
+            # ECS (Fargate services only - EC2 launch type is covered by EC2 discovery)
+            ecs = boto3.client("ecs", region_name=region)
+            try:
+                # List all clusters
+                cluster_arns = []
+                clusters_token = None
+                while True:
+                    if clusters_token:
+                        clusters_resp = ecs.list_clusters(nextToken=clusters_token)
+                    else:
+                        clusters_resp = ecs.list_clusters()
+                    cluster_arns.extend(clusters_resp.get("clusterArns", []))
+                    clusters_token = clusters_resp.get("nextToken")
+                    if not clusters_token:
+                        break
+
+                # For each cluster, list services with running tasks
+                for cluster_arn in cluster_arns:
+                    services_token = None
+                    while True:
+                        if services_token:
+                            services_resp = ecs.list_services(
+                                cluster=cluster_arn, nextToken=services_token
+                            )
+                        else:
+                            services_resp = ecs.list_services(cluster=cluster_arn)
+                        service_arns = services_resp.get("serviceArns", [])
+
+                        if service_arns:
+                            # Get service details
+                            desc_resp = ecs.describe_services(
+                                cluster=cluster_arn, services=service_arns
+                            )
+                            for svc in desc_resp.get("services", []):
+                                # Only include services with running tasks on Fargate
+                                if (
+                                    svc.get("runningCount", 0) > 0
+                                    and svc.get("launchType") == "FARGATE"
+                                ):
+                                    resources["ecs"].append(
+                                        {
+                                            "name": svc.get("serviceName"),
+                                            "arn": svc.get("serviceArn"),
+                                            "cluster": cluster_arn,
+                                            "region": region,
+                                            "running_count": svc.get("runningCount", 0),
+                                            "task_definition": svc.get("taskDefinition"),
+                                        }
+                                    )
+
+                        services_token = services_resp.get("nextToken")
+                        if not services_token:
+                            break
+            except (KeyError, AttributeError, BotoCoreError, ClientError) as e:
+                print(f"ECS discovery error in {region}: {e}")
+
         return resources
 
     def _get_pricing_client(self) -> Any:
@@ -337,6 +395,13 @@ class BudgetGuardian:
         # App Runner services
         for svc in resources["apprunner"]:
             cost = self._get_apprunner_hourly_cost(svc["arn"], svc["region"])
+            total += cost
+
+        # ECS Fargate services
+        for svc in resources["ecs"]:
+            cost = self._get_ecs_hourly_cost(
+                svc["task_definition"], svc["running_count"], svc["region"]
+            )
             total += cost
 
         return total
@@ -456,12 +521,53 @@ class BudgetGuardian:
             print(f"CloudWatch error for Lambda {function_name}: {e}")
             return Decimal("0")
 
+    def _get_apprunner_unit_prices(self, region: str) -> tuple[Decimal, Decimal]:
+        """Get App Runner vCPU and memory hourly prices from Pricing API.
+
+        Returns (cpu_price_per_vcpu_hour, memory_price_per_gb_hour).
+        Falls back to default prices if API fails.
+        """
+        location = self._region_to_location(region)
+        cpu_price = None
+        memory_price = None
+
+        try:
+            # Query for App Runner vCPU pricing
+            cpu_response = self._get_pricing_client().get_products(
+                ServiceCode="AWSAppRunner",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "computeType", "Value": "Provisioned"},
+                    {"Type": "TERM_MATCH", "Field": "computeResource", "Value": "vCPU"},
+                ],
+                MaxResults=1,
+            )
+            cpu_price = self._extract_price_from_response(cpu_response)
+
+            # Query for App Runner memory pricing
+            memory_response = self._get_pricing_client().get_products(
+                ServiceCode="AWSAppRunner",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "computeType", "Value": "Provisioned"},
+                    {"Type": "TERM_MATCH", "Field": "computeResource", "Value": "Memory"},
+                ],
+                MaxResults=1,
+            )
+            memory_price = self._extract_price_from_response(memory_response)
+        except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
+            print(f"Pricing API error for App Runner in {region}: {e}")
+
+        # Use defaults if API fails
+        return (
+            cpu_price if cpu_price is not None else Decimal("0.064"),
+            memory_price if memory_price is not None else Decimal("0.007"),
+        )
+
     def _get_apprunner_hourly_cost(self, service_arn: str, region: str) -> Decimal:
         """Get App Runner hourly cost based on configuration.
 
-        App Runner pricing (provisioned):
-        - $0.064 per vCPU-hour
-        - $0.007 per GB-hour (memory)
+        Uses Pricing API for vCPU and memory rates with fallback to defaults.
         """
         try:
             apprunner = boto3.client("apprunner", region_name=region)
@@ -473,14 +579,90 @@ class BudgetGuardian:
             # Memory is in MB (e.g., "2048" = 2 GB)
             memory = Decimal(config.get("Memory", "2048")) / 1024
 
-            # Pricing: $0.064/vCPU-hour + $0.007/GB-hour
-            cpu_cost = cpu * Decimal("0.064")
-            memory_cost = memory * Decimal("0.007")
+            # Get prices from Pricing API (with fallback)
+            cpu_rate, memory_rate = self._get_apprunner_unit_prices(region)
+
+            cpu_cost = cpu * cpu_rate
+            memory_cost = memory * memory_rate
 
             return cpu_cost + memory_cost
         except (BotoCoreError, ClientError) as e:
             print(f"AppRunner pricing error for {service_arn}: {e}")
             return DEFAULT_APPRUNNER_HOURLY
+
+    def _get_fargate_unit_prices(self, region: str) -> tuple[Decimal, Decimal]:
+        """Get Fargate vCPU and memory hourly prices from Pricing API.
+
+        Returns (cpu_price_per_vcpu_hour, memory_price_per_gb_hour).
+        Falls back to default prices if API fails.
+        """
+        location = self._region_to_location(region)
+        cpu_price = None
+        memory_price = None
+
+        try:
+            # Query for Fargate vCPU pricing
+            cpu_response = self._get_pricing_client().get_products(
+                ServiceCode="AmazonECS",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "cputype", "Value": "perCPU"},
+                ],
+                MaxResults=1,
+            )
+            cpu_price = self._extract_price_from_response(cpu_response)
+
+            # Query for Fargate memory pricing
+            memory_response = self._get_pricing_client().get_products(
+                ServiceCode="AmazonECS",
+                Filters=[
+                    {"Type": "TERM_MATCH", "Field": "location", "Value": location},
+                    {"Type": "TERM_MATCH", "Field": "memorytype", "Value": "perGB"},
+                ],
+                MaxResults=1,
+            )
+            memory_price = self._extract_price_from_response(memory_response)
+        except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
+            print(f"Pricing API error for Fargate in {region}: {e}")
+
+        # Use defaults if API fails
+        return (
+            cpu_price if cpu_price is not None else Decimal("0.04048"),
+            memory_price if memory_price is not None else Decimal("0.004445"),
+        )
+
+    def _get_ecs_hourly_cost(
+        self, task_definition: str, running_count: int, region: str
+    ) -> Decimal:
+        """Get ECS Fargate hourly cost based on task definition.
+
+        Uses Pricing API for vCPU and memory rates with fallback to defaults.
+        Cost is multiplied by running_count (number of tasks).
+        """
+        try:
+            ecs = boto3.client("ecs", region_name=region)
+            response = ecs.describe_task_definition(taskDefinition=task_definition)
+            task_def = response["taskDefinition"]
+
+            # Fargate task definitions have cpu and memory at the task level
+            # cpu is in units (256 = 0.25 vCPU, 1024 = 1 vCPU)
+            cpu_units = int(task_def.get("cpu", "256"))
+            cpu = Decimal(cpu_units) / 1024
+
+            # memory is in MB
+            memory_mb = int(task_def.get("memory", "512"))
+            memory = Decimal(memory_mb) / 1024
+
+            # Get prices from Pricing API (with fallback)
+            cpu_rate, memory_rate = self._get_fargate_unit_prices(region)
+
+            cpu_cost = cpu * cpu_rate
+            memory_cost = memory * memory_rate
+
+            return (cpu_cost + memory_cost) * running_count
+        except (BotoCoreError, ClientError) as e:
+            print(f"ECS pricing error for {task_definition}: {e}")
+            return DEFAULT_ECS_FARGATE_HOURLY * running_count
 
     def _detect_lambda_spikes(self, resources: dict) -> list[LambdaSpike]:
         """
@@ -698,6 +880,7 @@ class BudgetGuardian:
             "rds": [],
             "lambda": [],
             "apprunner": [],
+            "ecs": [],
         }
 
         # Stop EC2 instances
@@ -771,6 +954,25 @@ class BudgetGuardian:
                 results["apprunner"].append(
                     {"name": svc["name"], "status": "error", "error": str(e)}
                 )
+
+        # Scale down ECS Fargate services (set desired count to 0)
+        for svc in resources["ecs"]:
+            try:
+                ecs = boto3.client("ecs", region_name=svc["region"])
+                if not dry_run:
+                    ecs.update_service(
+                        cluster=svc["cluster"],
+                        service=svc["name"],
+                        desiredCount=0,
+                    )
+                results["ecs"].append(
+                    {
+                        "name": svc["name"],
+                        "status": "scaled_down" if not dry_run else "dry_run",
+                    }
+                )
+            except (BotoCoreError, ClientError) as e:
+                results["ecs"].append({"name": svc["name"], "status": "error", "error": str(e)})
 
         return results
 
@@ -867,6 +1069,7 @@ Running Resources:
 - RDS Instances: {len(status.resources["rds"])}
 - Lambda Functions: {len(status.resources["lambda"])}
 - App Runner Services: {len(status.resources["apprunner"])}
+- ECS Fargate Services: {len(status.resources["ecs"])}
 
 Hourly Cost: ${status.hourly_cost:.2f}
 Hours Until Period End: {status.remaining_hours}
@@ -881,6 +1084,7 @@ Remediation Executed:
 - RDS Stopped: {len([r for r in stop_results["rds"] if r["status"] == "stopped"])}
 - Lambda Throttled: {len([r for r in stop_results["lambda"] if r["status"] == "throttled"])}
 - App Runner Paused: {len([r for r in stop_results["apprunner"] if r["status"] == "paused"])}
+- ECS Scaled Down: {len([r for r in stop_results["ecs"] if r["status"] == "scaled_down"])}
 """
 
         try:
@@ -910,6 +1114,7 @@ Remediation Executed:
                 + len(
                     [r for r in stop_results["apprunner"] if r["status"] in ("paused", "dry_run")]
                 )
+                + len([r for r in stop_results["ecs"] if r["status"] in ("scaled_down", "dry_run")])
             )
             if actually_changed > 0:
                 alert_sent = self.send_alert(status, stop_results, dry_run=dry_run) is not None

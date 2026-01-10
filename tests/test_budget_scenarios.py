@@ -442,6 +442,10 @@ class TestAppRunner:
                 {"Reservations": [], "DBInstances": [], "Functions": []}
             ]
 
+        # Set up empty ECS mock
+        mock_ecs = mock_clients.setdefault("ecs", MagicMock())
+        mock_ecs.list_clusters.return_value = {"clusterArns": []}
+
         guardian = BudgetGuardian(
             regions=["us-east-1"],
             total_budget=Decimal("1000"),
@@ -455,19 +459,51 @@ class TestAppRunner:
 
     @patch("boto3.client")
     def test_apprunner_hourly_cost_calculation(self, mock_boto):
-        """Test App Runner cost calculation from instance config."""
-        mock_apprunner = MagicMock()
-        mock_boto.return_value = mock_apprunner
+        """Test App Runner cost calculation from instance config with Pricing API."""
+        mock_clients = {}
 
-        # 1 vCPU (1024 millicores), 2 GB memory
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        # Mock App Runner describe_service
+        mock_apprunner = mock_clients.setdefault("apprunner", MagicMock())
         mock_apprunner.describe_service.return_value = {
             "Service": {
                 "InstanceConfiguration": {
-                    "Cpu": "1024",
-                    "Memory": "2048",
+                    "Cpu": "1024",  # 1 vCPU
+                    "Memory": "2048",  # 2 GB
                 }
             }
         }
+
+        # Mock Pricing API responses
+        mock_pricing = mock_clients.setdefault("pricing", MagicMock())
+
+        def mock_get_products(**kwargs):
+            filters = {f["Field"]: f["Value"] for f in kwargs.get("Filters", [])}
+            if filters.get("computeResource") == "vCPU":
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.07"}}}}}}}'
+                    ]
+                }
+            elif filters.get("computeResource") == "Memory":
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.008"}}}}}}}'
+                    ]
+                }
+            return {"PriceList": []}
+
+        mock_pricing.get_products.side_effect = mock_get_products
+
+        # Mock SSM for region lookup
+        mock_ssm = mock_clients.setdefault("ssm", MagicMock())
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "US East (N. Virginia)"}}
 
         guardian = BudgetGuardian(
             regions=["us-east-1"],
@@ -478,8 +514,9 @@ class TestAppRunner:
             "us-east-1",
         )
 
-        # Expected: 1 vCPU * $0.064 + 2 GB * $0.007 = $0.064 + $0.014 = $0.078
-        assert cost == Decimal("0.078")
+        # Expected: 1 vCPU * $0.07 + 2 GB * $0.008 = $0.07 + $0.016 = $0.086
+        expected = Decimal("0.07") + Decimal("2") * Decimal("0.008")
+        assert cost == expected
 
     @patch("boto3.client")
     def test_pause_apprunner_service(self, mock_boto):
@@ -503,6 +540,7 @@ class TestAppRunner:
                     "region": "us-east-1",
                 }
             ],
+            "ecs": [],
         }
 
         results = guardian.stop_all_resources(resources, dry_run=False)
@@ -536,6 +574,7 @@ class TestAppRunner:
                     "region": "us-east-1",
                 }
             ],
+            "ecs": [],
         }
 
         results = guardian.stop_all_resources(resources, dry_run=True)
@@ -543,3 +582,205 @@ class TestAppRunner:
         # pause_service should NOT be called in dry run
         mock_apprunner.pause_service.assert_not_called()
         assert results["apprunner"][0]["status"] == "dry_run"
+
+
+class TestECS:
+    """Test ECS Fargate resource discovery and scaling down."""
+
+    @patch("boto3.client")
+    def test_discover_ecs_fargate_services(self, mock_boto):
+        """Test that running ECS Fargate services are discovered."""
+        mock_clients = {}
+
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        # Set up ECS mock
+        mock_ecs = mock_clients.setdefault("ecs", MagicMock())
+        mock_ecs.list_clusters.return_value = {
+            "clusterArns": ["arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster"]
+        }
+        mock_ecs.list_services.return_value = {
+            "serviceArns": ["arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service"]
+        }
+        mock_ecs.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "my-service",
+                    "serviceArn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service",
+                    "runningCount": 2,
+                    "launchType": "FARGATE",
+                    "taskDefinition": "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+                },
+                {
+                    "serviceName": "ec2-service",
+                    "serviceArn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/ec2-service",
+                    "runningCount": 1,
+                    "launchType": "EC2",  # Should be excluded
+                    "taskDefinition": "arn:aws:ecs:us-east-1:123456789012:task-definition/ec2-task:1",
+                },
+            ]
+        }
+
+        # Set up empty mocks for other services
+        for svc in ["ec2", "rds", "lambda", "apprunner"]:
+            mock_svc = mock_clients.setdefault(svc, MagicMock())
+            if svc == "apprunner":
+                mock_svc.list_services.return_value = {"ServiceSummaryList": []}
+            else:
+                mock_paginator = MagicMock()
+                mock_svc.get_paginator.return_value = mock_paginator
+                mock_paginator.paginate.return_value = [
+                    {"Reservations": [], "DBInstances": [], "Functions": []}
+                ]
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+        resources = guardian._discover_resources()
+
+        # Only FARGATE services with running tasks should be discovered
+        assert len(resources["ecs"]) == 1
+        assert resources["ecs"][0]["name"] == "my-service"
+        assert resources["ecs"][0]["running_count"] == 2
+
+    @patch("boto3.client")
+    def test_ecs_hourly_cost_calculation(self, mock_boto):
+        """Test ECS Fargate cost calculation from task definition with Pricing API."""
+        mock_clients = {}
+
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        # Mock ECS describe_task_definition
+        mock_ecs = mock_clients.setdefault("ecs", MagicMock())
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {
+                "cpu": "1024",  # 1 vCPU
+                "memory": "2048",  # 2 GB
+            }
+        }
+
+        # Mock Pricing API responses
+        mock_pricing = mock_clients.setdefault("pricing", MagicMock())
+
+        def mock_get_products(**kwargs):
+            filters = {f["Field"]: f["Value"] for f in kwargs.get("Filters", [])}
+            if "cputype" in filters:
+                # vCPU pricing
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.05"}}}}}}}'
+                    ]
+                }
+            elif "memorytype" in filters:
+                # Memory pricing
+                return {
+                    "PriceList": [
+                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.005"}}}}}}}'
+                    ]
+                }
+            return {"PriceList": []}
+
+        mock_pricing.get_products.side_effect = mock_get_products
+
+        # Mock SSM for region lookup
+        mock_ssm = mock_clients.setdefault("ssm", MagicMock())
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "US East (N. Virginia)"}}
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+        cost = guardian._get_ecs_hourly_cost(
+            "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+            running_count=2,
+            region="us-east-1",
+        )
+
+        # Expected per task: 1 vCPU * $0.05 + 2 GB * $0.005 = $0.05 + $0.01 = $0.06
+        # With 2 tasks: $0.06 * 2 = $0.12
+        expected = (Decimal("0.05") + Decimal("2") * Decimal("0.005")) * 2
+        assert cost == expected
+
+    @patch("boto3.client")
+    def test_scale_down_ecs_service(self, mock_boto):
+        """Test scaling down ECS services."""
+        mock_ecs = MagicMock()
+        mock_boto.return_value = mock_ecs
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+
+        resources = {
+            "ec2": [],
+            "rds": [],
+            "lambda": [],
+            "apprunner": [],
+            "ecs": [
+                {
+                    "name": "my-service",
+                    "arn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service",
+                    "cluster": "arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster",
+                    "region": "us-east-1",
+                    "running_count": 2,
+                    "task_definition": "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+                }
+            ],
+        }
+
+        results = guardian.stop_all_resources(resources, dry_run=False)
+
+        # Verify update_service was called with desiredCount=0
+        mock_ecs.update_service.assert_called_once_with(
+            cluster="arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster",
+            service="my-service",
+            desiredCount=0,
+        )
+        assert len(results["ecs"]) == 1
+        assert results["ecs"][0]["status"] == "scaled_down"
+
+    @patch("boto3.client")
+    def test_scale_down_ecs_dry_run(self, mock_boto):
+        """Test dry run does not actually scale down services."""
+        mock_ecs = MagicMock()
+        mock_boto.return_value = mock_ecs
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+
+        resources = {
+            "ec2": [],
+            "rds": [],
+            "lambda": [],
+            "apprunner": [],
+            "ecs": [
+                {
+                    "name": "my-service",
+                    "arn": "arn:aws:ecs:us-east-1:123456789012:service/my-cluster/my-service",
+                    "cluster": "arn:aws:ecs:us-east-1:123456789012:cluster/my-cluster",
+                    "region": "us-east-1",
+                    "running_count": 2,
+                    "task_definition": "arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1",
+                }
+            ],
+        }
+
+        results = guardian.stop_all_resources(resources, dry_run=True)
+
+        # update_service should NOT be called in dry run
+        mock_ecs.update_service.assert_not_called()
+        assert results["ecs"][0]["status"] == "dry_run"
