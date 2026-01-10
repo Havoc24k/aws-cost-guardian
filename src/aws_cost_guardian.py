@@ -94,6 +94,7 @@ class BudgetGuardian:
         self.sns = boto3.client("sns") if sns_topic_arn else None
         self._account_info: Optional[dict[str, str]] = None
         self._pricing_client: Optional[Any] = None
+        self._region_locations: dict[str, str] = {}
 
     @classmethod
     def from_env(cls) -> "BudgetGuardian":
@@ -316,7 +317,11 @@ class BudgetGuardian:
                 ServiceCode="AmazonEC2",
                 Filters=[
                     {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_type},
-                    {"Type": "TERM_MATCH", "Field": "location", "Value": self._region_to_location(region)},
+                    {
+                        "Type": "TERM_MATCH",
+                        "Field": "location",
+                        "Value": self._region_to_location(region),
+                    },
                     {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
                     {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
                     {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
@@ -339,7 +344,11 @@ class BudgetGuardian:
                 ServiceCode="AmazonRDS",
                 Filters=[
                     {"Type": "TERM_MATCH", "Field": "instanceType", "Value": instance_class},
-                    {"Type": "TERM_MATCH", "Field": "location", "Value": self._region_to_location(region)},
+                    {
+                        "Type": "TERM_MATCH",
+                        "Field": "location",
+                        "Value": self._region_to_location(region),
+                    },
                     {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine},
                 ],
                 MaxResults=1,
@@ -476,8 +485,7 @@ class BudgetGuardian:
             cw = boto3.client("cloudwatch", region_name=region)
             now = datetime.now(timezone.utc)
 
-            # STEP 1: Get current invocation rate from SHORT window
-            # Example: Last 5 minutes of activity
+            # Get current invocation rate from short window (e.g., last 5 minutes)
             short_start = now - timedelta(minutes=self.lambda_spike_window_minutes)
             short_response = cw.get_metric_statistics(
                 Namespace="AWS/Lambda",
@@ -489,8 +497,7 @@ class BudgetGuardian:
                 Statistics=["Sum"],
             )
 
-            # STEP 2: Get baseline invocation rate from LONG window
-            # Example: Last 7 days (168 hours) of activity
+            # Get baseline invocation rate from long window (e.g., last 7 days)
             baseline_start = now - timedelta(hours=self.lambda_baseline_hours)
             baseline_response = cw.get_metric_statistics(
                 Namespace="AWS/Lambda",
@@ -502,7 +509,7 @@ class BudgetGuardian:
                 Statistics=["Sum"],
             )
 
-            # STEP 3: Extract invocation counts from responses
+            # Extract invocation counts from responses
             current_invocations = Decimal("0")
             short_datapoints = short_response.get("Datapoints", [])
             if short_datapoints:
@@ -513,39 +520,27 @@ class BudgetGuardian:
             if baseline_datapoints:
                 baseline_invocations = Decimal(str(baseline_datapoints[0].get("Sum", 0)))
 
-            # STEP 4: Calculate rates per minute
-            # current_rate: invocations per minute in short window
-            # baseline_rate: average invocations per minute over baseline period
+            # Calculate rates per minute for both windows
             current_rate = current_invocations / self.lambda_spike_window_minutes
             baseline_minutes = self.lambda_baseline_hours * 60
             baseline_rate = baseline_invocations / baseline_minutes
 
-            # STEP 5: Calculate spike ratio
+            # Calculate spike ratio (current rate vs baseline rate)
             if baseline_rate > 0:
-                # Normal case: compare current to baseline
                 spike_ratio = current_rate / baseline_rate
             elif current_rate > 0:
-                # Edge case: no baseline but has current activity
-                # This is a new function or was completely idle - flag as potential spike
+                # No baseline but has current activity - new function or was idle
                 spike_ratio = Decimal("999")
             else:
-                # No activity at all - nothing to detect
+                # No activity at all
                 return None
 
-            # STEP 6: Check if spike exceeds threshold
+            # Check if spike exceeds threshold and calculate projected daily cost
             if spike_ratio >= self.lambda_spike_threshold:
-                # STEP 7: Calculate projected daily cost at current rate
-                # This shows how much it would cost if spike continues for 24h
                 invocations_per_day = current_rate * 60 * 24
-
-                # Estimate compute cost (assume 1 second duration if no baseline)
-                avg_duration_ms = Decimal("1000")  # Conservative 1s estimate
                 memory_gb = Decimal(str(memory_mb)) / 1024
-                gb_seconds_per_day = (avg_duration_ms / 1000) * memory_gb * invocations_per_day
-
-                # Lambda pricing:
-                # - $0.0000002 per request ($0.20 per 1M)
-                # - $0.0000166667 per GB-second
+                # Assume 1 second duration for cost projection
+                gb_seconds_per_day = memory_gb * invocations_per_day
                 request_cost = invocations_per_day * LAMBDA_PRICE_PER_REQUEST
                 compute_cost = gb_seconds_per_day * LAMBDA_PRICE_PER_GB_SECOND
                 projected_daily_cost = request_cost + compute_cost
@@ -565,23 +560,25 @@ class BudgetGuardian:
             print(f"Spike detection error for Lambda {function_name}: {e}")
             return None
 
-    @staticmethod
-    def _region_to_location(region: str) -> str:
-        """Convert AWS region code to Pricing API location name."""
-        locations = {
-            "us-east-1": "US East (N. Virginia)",
-            "us-east-2": "US East (Ohio)",
-            "us-west-1": "US West (N. California)",
-            "us-west-2": "US West (Oregon)",
-            "eu-west-1": "EU (Ireland)",
-            "eu-west-2": "EU (London)",
-            "eu-west-3": "EU (Paris)",
-            "eu-central-1": "EU (Frankfurt)",
-            "ap-northeast-1": "Asia Pacific (Tokyo)",
-            "ap-southeast-1": "Asia Pacific (Singapore)",
-            "ap-southeast-2": "Asia Pacific (Sydney)",
-        }
-        return locations.get(region, "US East (N. Virginia)")
+    def _region_to_location(self, region: str) -> str:
+        """Convert AWS region code to Pricing API location name.
+
+        Uses SSM public parameters to dynamically fetch region names,
+        with caching to avoid repeated API calls.
+        """
+        if region in self._region_locations:
+            return self._region_locations[region]
+
+        try:
+            ssm = boto3.client("ssm", region_name="us-east-1")
+            response = ssm.get_parameter(
+                Name=f"/aws/service/global-infrastructure/regions/{region}/longName"
+            )
+            location = response["Parameter"]["Value"]
+            self._region_locations[region] = location
+            return location
+        except (BotoCoreError, ClientError):
+            return "US East (N. Virginia)"
 
     def _get_period_bounds(self) -> tuple[datetime, datetime]:
         """Get start and end of budget period.
@@ -792,7 +789,7 @@ Running Resources:
 - Lambda Functions: {len(status.resources["lambda"])}
 
 Hourly Cost: ${status.hourly_cost:.2f}
-Hours Until Month End: {status.remaining_hours}
+Hours Until Period End: {status.remaining_hours}
 
 Thresholds Breached: {", ".join(map(str, status.thresholds_breached))}%
 """
@@ -826,7 +823,9 @@ Remediation Executed:
             actually_changed = (
                 len([r for r in stop_results["ec2"] if r["status"] in ("stopped", "dry_run")])
                 + len([r for r in stop_results["rds"] if r["status"] in ("stopped", "dry_run")])
-                + len([r for r in stop_results["lambda"] if r["status"] in ("throttled", "dry_run")])
+                + len(
+                    [r for r in stop_results["lambda"] if r["status"] in ("throttled", "dry_run")]
+                )
             )
             if actually_changed > 0:
                 alert_sent = self.send_alert(status, stop_results, dry_run=dry_run) is not None
