@@ -34,10 +34,17 @@ These are measured facts, not assumptions. Do not deviate from them.
   services with `runningCount > 0`, so seeds **must poll** until then. `launchType` IS correctly
   reported as `'FARGATE'`.
 - **RDS works** and reports `available` quickly.
-- **Pricing API supports `AmazonEC2` ONLY.** `AmazonRDS` and `AmazonECS` raise
-  `InvalidParameterException: Invalid ServiceCode`, so RDS and Fargate costs always fall back to
-  `DEFAULT_RDS_HOURLY` / `DEFAULT_ECS_FARGATE_HOURLY`. Never assert that RDS/Fargate pricing came
-  from the API.
+- **The Pricing API is effectively UNUSABLE against Floci — every price falls back to a constant.**
+  - `AmazonRDS` and `AmazonECS` raise `InvalidParameterException: Invalid ServiceCode`.
+  - `AmazonEC2` is a valid service code, BUT Floci does not implement `TERM_MATCH` filtering: an
+    unfiltered `get_products` returns 2 products, while adding the guardian's `instanceType` filter
+    returns **0**. So `_get_ec2_hourly_cost()` finds no price and returns `DEFAULT_EC2_HOURLY`.
+  - MEASURED: `_get_ec2_hourly_cost("t3.medium", "us-east-1")` → `0.10`, which is exactly
+    `DEFAULT_EC2_HOURLY`. The observed `hourly_cost=$0.2623425` decomposes as
+    `0.10 (EC2 fallback) + 0.15 (RDS fallback) + 0.0123425 (Fargate, computed from fallback unit rates)`.
+  - **CONSEQUENCE:** the e2e layer does NOT exercise the Pricing API path. `hourly_cost > 0` proves
+    only that the FALLBACK path produces a number — never claim it proves "the pricing path ran".
+    Real Pricing-API correctness (the audit's engine-name / filter bugs) stays out of e2e scope.
 - **Cost Explorer synthesizes ≈ $0** month-to-date spend. The `actual_exceeded` test must tolerate
   this (it skips when `actual_spend == 0`).
 - **SSM `/aws/service/global-infrastructure/.../longName` is NOT present** → `_region_to_location()`
