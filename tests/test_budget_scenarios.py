@@ -595,3 +595,67 @@ class TestECS:
         # update_service should NOT be called in dry run
         mock_ecs.update_service.assert_not_called()
         assert results["ecs"][0]["status"] == "dry_run"
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "audit #7: capacity-provider Fargate services have launchType omitted, so the "
+            "`launchType == 'FARGATE'` discovery check misses them entirely — they are never "
+            "discovered or stopped"
+        ),
+    )
+    @patch("boto3.client")
+    def test_discover_capacity_provider_fargate_service(self, mock_boto):
+        """Real AWS omits `launchType` for services created with capacityProviderStrategy;
+        `_discover_resources()` only matches on `launchType == "FARGATE"`, so this shape is
+        silently skipped. This test documents that gap and must XFAIL until the discovery
+        check is fixed to also recognize capacityProviderStrategy-based Fargate services.
+        """
+        mock_clients = {}
+
+        def get_mock_client(service_name, **kwargs):
+            if service_name not in mock_clients:
+                mock_clients[service_name] = MagicMock()
+            return mock_clients[service_name]
+
+        mock_boto.side_effect = get_mock_client
+
+        mock_ecs = mock_clients.setdefault("ecs", MagicMock())
+        mock_ecs.list_clusters.return_value = {
+            "clusterArns": ["arn:aws:ecs:us-east-1:123456789012:cluster/cp-cluster"]
+        }
+        mock_ecs.list_services.return_value = {
+            "serviceArns": ["arn:aws:ecs:us-east-1:123456789012:service/cp-cluster/cp-svc"]
+        }
+        mock_ecs.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "cp-svc",
+                    "serviceArn": "arn:aws:ecs:us-east-1:123456789012:service/cp-cluster/cp-svc",
+                    "runningCount": 1,
+                    # NOTE: no "launchType" key here — real AWS omits it for services using
+                    # capacityProviderStrategy instead of launchType.
+                    "capacityProviderStrategy": [{"capacityProvider": "FARGATE", "weight": 1}],
+                    "taskDefinition": "arn:aws:ecs:us-east-1:123456789012:task-definition/cp-task:1",
+                }
+            ]
+        }
+
+        # Set up empty mocks for other services
+        for svc in ["ec2", "rds", "lambda"]:
+            mock_svc = mock_clients.setdefault(svc, MagicMock())
+            mock_paginator = MagicMock()
+            mock_svc.get_paginator.return_value = mock_paginator
+            mock_paginator.paginate.return_value = [
+                {"Reservations": [], "DBInstances": [], "Functions": []}
+            ]
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("1000"),
+        )
+        resources = guardian._discover_resources()
+
+        # Correct behavior: the capacity-provider Fargate service should be discovered.
+        assert len(resources["ecs"]) == 1
+        assert resources["ecs"][0]["name"] == "cp-svc"
