@@ -713,7 +713,7 @@ class BudgetGuardian:
             response = ssm.get_parameter(
                 Name=f"/aws/service/global-infrastructure/regions/{region}/longName"
             )
-            location = response["Parameter"]["Value"]
+            location = str(response["Parameter"]["Value"])
             self._region_locations[region] = location
             return location
         except (BotoCoreError, ClientError):
