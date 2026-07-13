@@ -19,6 +19,49 @@ DEFAULT_EC2_HOURLY = Decimal("0.10")
 DEFAULT_RDS_HOURLY = Decimal("0.15")
 DEFAULT_ECS_FARGATE_HOURLY = Decimal("0.05")
 
+# describe_db_instances returns engine CODES ("postgres"); the Pricing API's databaseEngine
+# attribute only matches DISPLAY names ("PostgreSQL"). Without this mapping every RDS price
+# lookup returns zero results and silently falls back to DEFAULT_RDS_HOURLY.
+RDS_ENGINE_TO_PRICING_NAME = {
+    "postgres": "PostgreSQL",
+    "mysql": "MySQL",
+    "mariadb": "MariaDB",
+    "aurora-mysql": "Aurora MySQL",
+    "aurora-postgresql": "Aurora PostgreSQL",
+    "oracle-ee": "Oracle",
+    "oracle-ee-cdb": "Oracle",
+    "oracle-se2": "Oracle",
+    "oracle-se2-cdb": "Oracle",
+    "sqlserver-ee": "SQL Server",
+    "sqlserver-se": "SQL Server",
+    "sqlserver-ex": "SQL Server",
+    "sqlserver-web": "SQL Server",
+    "db2-ae": "Db2",
+    "db2-se": "Db2",
+}
+
+# A DB instance is billed for instance-hours in almost every state. Only these cost nothing
+# (or are already stopped), so anything NOT listed here is treated as billable and discoverable.
+# Notably this includes "backing-up", "modifying", "rebooting", etc., which the old
+# `status == "available"` check silently ignored.
+RDS_NON_BILLABLE_STATUSES = frozenset(
+    {
+        "creating",
+        "deleting",
+        "delete-precheck",
+        "failed",
+        "inaccessible-encryption-credentials",
+        "incompatible-create",
+        "incompatible-network",
+        "incompatible-restore",
+        "insufficient-capacity",
+        "upgrade-failed",
+        "stopped",
+        "stopping",
+        "starting",
+    }
+)
+
 # Lambda pricing constants
 LAMBDA_PRICE_PER_REQUEST = Decimal("0.0000002")  # $0.20 per 1M requests
 LAMBDA_PRICE_PER_GB_SECOND = Decimal("0.0000166667")  # $0.0000166667 per GB-second
@@ -28,6 +71,34 @@ DEFAULT_LAMBDA_LOOKBACK_HOURS = 24  # Default hours to look back for usage metri
 DEFAULT_LAMBDA_SPIKE_THRESHOLD = 10  # Alert if rate is 10x baseline
 DEFAULT_LAMBDA_SPIKE_WINDOW_MINUTES = 5  # Check last N minutes for spike
 DEFAULT_LAMBDA_BASELINE_HOURS = 168  # 7 days baseline for comparison
+
+
+def _is_fargate_service(svc: dict[str, Any]) -> bool:
+    """True if an ECS service runs on Fargate.
+
+    `launchType` and `capacityProviderStrategy` are mutually exclusive in the ECS API: a
+    service created with a capacity provider has `launchType` OMITTED entirely. Checking only
+    `launchType == "FARGATE"` therefore misses every capacity-provider Fargate service, so the
+    guardian never discovered or stopped them.
+    """
+    if svc.get("launchType") == "FARGATE":
+        return True
+    return any(
+        cp.get("capacityProvider") in ("FARGATE", "FARGATE_SPOT")
+        for cp in svc.get("capacityProviderStrategy") or []
+    )
+
+
+def _sum_datapoints(response: dict[str, Any]) -> Decimal:
+    """Total a CloudWatch metric across ALL returned datapoints.
+
+    GetMetricStatistics guarantees neither a single datapoint per window nor any ordering, so
+    reading Datapoints[0] picks an arbitrary bucket and silently under-counts.
+    """
+    return sum(
+        (Decimal(str(dp.get("Sum", 0))) for dp in response.get("Datapoints", [])),
+        Decimal("0"),
+    )
 
 
 @dataclass
@@ -237,19 +308,31 @@ class BudgetGuardian:
                 rds_paginator = rds.get_paginator("describe_db_instances")
                 for rds_page in rds_paginator.paginate():
                     for db in rds_page.get("DBInstances", []):
-                        if db.get("DBInstanceStatus") == "available":
-                            db_id = db.get("DBInstanceIdentifier")
-                            db_class = db.get("DBInstanceClass")
-                            engine = db.get("Engine")
-                            if db_id and db_class and engine:
-                                resources["rds"].append(
-                                    {
-                                        "id": db_id,
-                                        "class": db_class,
-                                        "engine": engine,
-                                        "region": region,
-                                    }
-                                )
+                        # Anything not explicitly non-billable is costing instance-hours.
+                        if db.get("DBInstanceStatus") in RDS_NON_BILLABLE_STATUSES:
+                            continue
+                        db_id = db.get("DBInstanceIdentifier")
+                        db_class = db.get("DBInstanceClass")
+                        engine = db.get("Engine")
+                        if db_id and db_class and engine:
+                            resources["rds"].append(
+                                {
+                                    "id": db_id,
+                                    "class": db_class,
+                                    "engine": engine,
+                                    "region": region,
+                                    # Aurora members must be stopped via their CLUSTER.
+                                    "cluster_id": db.get("DBClusterIdentifier"),
+                                    "multi_az": db.get("MultiAZ", False),
+                                    # AWS refuses to stop a read replica or a replication source.
+                                    "is_read_replica": bool(
+                                        db.get("ReadReplicaSourceDBInstanceIdentifier")
+                                    ),
+                                    "has_read_replicas": bool(
+                                        db.get("ReadReplicaDBInstanceIdentifiers")
+                                    ),
+                                }
+                            )
             except (KeyError, AttributeError, BotoCoreError, ClientError) as e:
                 print(f"RDS discovery error in {region}: {e}")
 
@@ -308,10 +391,7 @@ class BudgetGuardian:
                             )
                             for svc in desc_resp.get("services", []):
                                 # Only include services with running tasks on Fargate
-                                if (
-                                    svc.get("runningCount", 0) > 0
-                                    and svc.get("launchType") == "FARGATE"
-                                ):
+                                if svc.get("runningCount", 0) > 0 and _is_fargate_service(svc):
                                     resources["ecs"].append(
                                         {
                                             "name": svc.get("serviceName"),
@@ -347,6 +427,25 @@ class BudgetGuardian:
                     return Decimal(price_dim["pricePerUnit"]["USD"])
         return None
 
+    def _select_fargate_price(self, response: dict, usage_suffix: str) -> Optional[Decimal]:
+        """Pick the Linux/x86 on-demand Fargate rate from a multi-product price list.
+
+        The Fargate filters also match ARM, Windows, and the ECS-on-EC2 product (which is
+        priced $0.00). Match on `usagetype` and reject zero prices so a bad pick cannot make
+        Fargate look free.
+        """
+        for entry in response.get("PriceList", []):
+            data = json.loads(entry)
+            usagetype = data.get("product", {}).get("attributes", {}).get("usagetype", "")
+            if usage_suffix not in usagetype:
+                continue
+            if "ARM" in usagetype or "Windows" in usagetype:
+                continue
+            price = self._extract_price_from_response({"PriceList": [entry]})
+            if price is not None and price > 0:
+                return price
+        return None
+
     def _calculate_hourly_cost(self, resources: dict[str, list[dict[str, Any]]]) -> Decimal:
         """Calculate total hourly cost of running resources."""
         total = Decimal("0")
@@ -358,7 +457,9 @@ class BudgetGuardian:
 
         # RDS instances
         for db in resources["rds"]:
-            cost = self._get_rds_hourly_cost(db["class"], db["engine"], db["region"])
+            cost = self._get_rds_hourly_cost(
+                db["class"], db["engine"], db["region"], db.get("multi_az", False)
+            )
             total += cost
 
         # Lambda functions (based on recent usage)
@@ -402,9 +503,13 @@ class BudgetGuardian:
 
         return DEFAULT_EC2_HOURLY
 
-    def _get_rds_hourly_cost(self, instance_class: str, engine: str, region: str) -> Decimal:
+    def _get_rds_hourly_cost(
+        self, instance_class: str, engine: str, region: str, multi_az: bool = False
+    ) -> Decimal:
         """Get RDS hourly cost. Uses fallback if Pricing API fails."""
         try:
+            # The Pricing API matches display names, not boto3 engine codes.
+            pricing_engine = RDS_ENGINE_TO_PRICING_NAME.get(engine, engine)
             response = self._get_pricing_client().get_products(
                 ServiceCode="AmazonRDS",
                 Filters=[
@@ -414,7 +519,14 @@ class BudgetGuardian:
                         "Field": "location",
                         "Value": self._region_to_location(region),
                     },
-                    {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": engine},
+                    {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": pricing_engine},
+                    # Single-AZ and Multi-AZ are different products at different prices; without
+                    # this the query is non-deterministic about which one it returns.
+                    {
+                        "Type": "TERM_MATCH",
+                        "Field": "deploymentOption",
+                        "Value": "Multi-AZ" if multi_az else "Single-AZ",
+                    },
                 ],
                 MaxResults=1,
             )
@@ -456,17 +568,10 @@ class BudgetGuardian:
                 Statistics=["Sum"],
             )
 
-            # Extract values
-            invocations = Decimal("0")
-            total_duration_ms = Decimal("0")
-
-            inv_datapoints = invocations_response.get("Datapoints", [])
-            if inv_datapoints:
-                invocations = Decimal(str(inv_datapoints[0].get("Sum", 0)))
-
-            dur_datapoints = duration_response.get("Datapoints", [])
-            if dur_datapoints:
-                total_duration_ms = Decimal(str(dur_datapoints[0].get("Sum", 0)))
+            # Sum across every returned datapoint — CloudWatch may split the window into
+            # several buckets and does not guarantee their order.
+            invocations = _sum_datapoints(invocations_response)
+            total_duration_ms = _sum_datapoints(duration_response)
 
             if invocations == 0:
                 return Decimal("0")
@@ -501,27 +606,28 @@ class BudgetGuardian:
         memory_price = None
 
         try:
-            # Query for Fargate vCPU pricing
+            # These filters are NOT unique: they also match the ARM, Windows, and
+            # ECS-on-EC2 (priced $0.00) products. Fetch them all and pick the Linux/x86
+            # Fargate one explicitly -- taking PriceList[0] could project a $0.00 rate.
             cpu_response = self._get_pricing_client().get_products(
                 ServiceCode="AmazonECS",
                 Filters=[
                     {"Type": "TERM_MATCH", "Field": "location", "Value": location},
                     {"Type": "TERM_MATCH", "Field": "cputype", "Value": "perCPU"},
                 ],
-                MaxResults=1,
+                MaxResults=100,
             )
-            cpu_price = self._extract_price_from_response(cpu_response)
+            cpu_price = self._select_fargate_price(cpu_response, "vCPU-Hours")
 
-            # Query for Fargate memory pricing
             memory_response = self._get_pricing_client().get_products(
                 ServiceCode="AmazonECS",
                 Filters=[
                     {"Type": "TERM_MATCH", "Field": "location", "Value": location},
                     {"Type": "TERM_MATCH", "Field": "memorytype", "Value": "perGB"},
                 ],
-                MaxResults=1,
+                MaxResults=100,
             )
-            memory_price = self._extract_price_from_response(memory_response)
+            memory_price = self._select_fargate_price(memory_response, "GB-Hours")
         except (KeyError, IndexError, ValueError, BotoCoreError, ClientError) as e:
             print(f"Pricing API error for Fargate in {region}: {e}")
 
@@ -648,16 +754,10 @@ class BudgetGuardian:
                 Statistics=["Sum"],
             )
 
-            # Extract invocation counts from responses
-            current_invocations = Decimal("0")
-            short_datapoints = short_response.get("Datapoints", [])
-            if short_datapoints:
-                current_invocations = Decimal(str(short_datapoints[0].get("Sum", 0)))
-
-            baseline_invocations = Decimal("0")
-            baseline_datapoints = baseline_response.get("Datapoints", [])
-            if baseline_datapoints:
-                baseline_invocations = Decimal(str(baseline_datapoints[0].get("Sum", 0)))
+            # Sum across every returned datapoint. Reading only Datapoints[0] could see an
+            # empty bucket, compute baseline_rate == 0, and report a spurious 999x "spike".
+            current_invocations = _sum_datapoints(short_response)
+            baseline_invocations = _sum_datapoints(baseline_response)
 
             # Calculate rates per minute for both windows
             current_rate = current_invocations / self.lambda_spike_window_minutes
@@ -771,6 +871,21 @@ class BudgetGuardian:
             return "alert", breached, False
         return "ok", [], False
 
+    @staticmethod
+    def _rds_skip_reason(db: dict[str, Any]) -> Optional[str]:
+        """Why AWS would refuse to stop this DB, or None if it is stoppable.
+
+        Calling StopDBInstance on these just raises, so report them honestly instead: an
+        operator needs to know a billing resource could NOT be shut down.
+        """
+        if db.get("is_read_replica"):
+            return "cannot stop a read replica"
+        if db.get("has_read_replicas"):
+            return "cannot stop a DB instance that has read replicas"
+        if str(db.get("engine", "")).startswith("sqlserver") and db.get("multi_az"):
+            return "RDS for SQL Server does not support stopping a Multi-AZ instance"
+        return None
+
     def stop_all_resources(
         self, resources: dict[str, Any], dry_run: bool = False
     ) -> dict[str, list[dict[str, Any]]]:
@@ -797,12 +912,30 @@ class BudgetGuardian:
             except (BotoCoreError, ClientError) as e:
                 results["ec2"].append({"id": instance["id"], "status": "error", "error": str(e)})
 
-        # Stop RDS instances
+        # Stop RDS instances (Aurora members must be stopped via their cluster, once)
+        stopped_clusters: set[str] = set()
         for db in resources["rds"]:
             try:
                 rds = boto3.client("rds", region_name=db["region"])
-                if not dry_run:
+                skip_reason = self._rds_skip_reason(db)
+                if skip_reason:
+                    results["rds"].append(
+                        {"id": db["id"], "status": "skipped", "reason": skip_reason}
+                    )
+                    continue
+
+                cluster_id = db.get("cluster_id")
+                if str(db.get("engine", "")).startswith("aurora") and cluster_id:
+                    # AWS rejects StopDBInstance for Aurora: the whole cluster stops at once.
+                    if cluster_id in stopped_clusters:
+                        results["rds"].append({"id": db["id"], "status": "cluster_already_stopped"})
+                        continue
+                    if not dry_run:
+                        rds.stop_db_cluster(DBClusterIdentifier=cluster_id)
+                    stopped_clusters.add(cluster_id)
+                elif not dry_run:
                     rds.stop_db_instance(DBInstanceIdentifier=db["id"])
+
                 results["rds"].append(
                     {"id": db["id"], "status": "stopped" if not dry_run else "dry_run"}
                 )
@@ -966,6 +1099,19 @@ Remediation Executed:
 - Lambda Throttled: {len([r for r in stop_results["lambda"] if r["status"] == "throttled"])}
 - ECS Scaled Down: {len([r for r in stop_results["ecs"] if r["status"] == "scaled_down"])}
 """
+            # A resource we could NOT stop is still costing money — say so loudly.
+            could_not_stop = [
+                r
+                for kind in ("ec2", "rds", "lambda", "ecs")
+                for r in stop_results[kind]
+                if r["status"] in ("skipped", "error")
+            ]
+            if could_not_stop:
+                message += "\nCOULD NOT BE STOPPED (still incurring cost):\n"
+                for r in could_not_stop:
+                    name = r.get("id") or r.get("name")
+                    detail = r.get("reason") or r.get("error", "")
+                    message += f"- {name}: {detail}\n"
 
         try:
             response = self.sns.publish(

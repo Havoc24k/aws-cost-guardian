@@ -489,17 +489,18 @@ class TestECS:
         def mock_get_products(**kwargs):
             filters = {f["Field"]: f["Value"] for f in kwargs.get("Filters", [])}
             if "cputype" in filters:
-                # vCPU pricing
+                # vCPU pricing. Real AWS always returns product.attributes.usagetype, which the
+                # guardian uses to pick the Linux/x86 rate over the ARM/Windows/$0.00 products.
                 return {
                     "PriceList": [
-                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.05"}}}}}}}'
+                        '{"product": {"attributes": {"usagetype": "USE1-Fargate-vCPU-Hours:perCPU"}}, "terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.05"}}}}}}}'
                     ]
                 }
             elif "memorytype" in filters:
                 # Memory pricing
                 return {
                     "PriceList": [
-                        '{"terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.005"}}}}}}}'
+                        '{"product": {"attributes": {"usagetype": "USE1-Fargate-GB-Hours"}}, "terms": {"OnDemand": {"term1": {"priceDimensions": {"dim1": {"pricePerUnit": {"USD": "0.005"}}}}}}}'
                     ]
                 }
             return {"PriceList": []}
@@ -596,20 +597,11 @@ class TestECS:
         mock_ecs.update_service.assert_not_called()
         assert results["ecs"][0]["status"] == "dry_run"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "audit #7: capacity-provider Fargate services have launchType omitted, so the "
-            "`launchType == 'FARGATE'` discovery check misses them entirely — they are never "
-            "discovered or stopped"
-        ),
-    )
     @patch("boto3.client")
     def test_discover_capacity_provider_fargate_service(self, mock_boto):
-        """Real AWS omits `launchType` for services created with capacityProviderStrategy;
-        `_discover_resources()` only matches on `launchType == "FARGATE"`, so this shape is
-        silently skipped. This test documents that gap and must XFAIL until the discovery
-        check is fixed to also recognize capacityProviderStrategy-based Fargate services.
+        """Real AWS OMITS `launchType` for services created with a capacityProviderStrategy
+        (the two fields are mutually exclusive). Discovery must recognise these as Fargate
+        via the capacity provider, or they would never be discovered or stopped (audit #7).
         """
         mock_clients = {}
 
