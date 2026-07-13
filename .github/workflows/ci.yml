@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync
+      - run: uv sync --all-extras
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src/ cli.py
@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync
+      - run: uv sync --all-extras
       # CI hygiene: tear down any leftover containers from a previous run first.
       # Orphaned Floci containers can squat host ports (e.g. 4566) and cause
       # spurious "EC2 seed died" failures further down the pipeline.
