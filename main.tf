@@ -91,7 +91,6 @@ resource "aws_iam_role_policy" "lambda" {
         Effect = "Allow"
         Action = [
           "rds:DescribeDBInstances",
-          "rds:DescribeDBClusters",
           "rds:StopDBInstance",
           # Aurora members cannot be stopped individually; the cluster must be stopped.
           "rds:StopDBCluster"

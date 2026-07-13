@@ -439,11 +439,19 @@ class BudgetGuardian:
             usagetype = data.get("product", {}).get("attributes", {}).get("usagetype", "")
             if usage_suffix not in usagetype:
                 continue
-            if "ARM" in usagetype or "Windows" in usagetype:
+            # "Fargate" excludes the ECS-on-EC2 product outright (it is priced $0.00 and its
+            # usagetype also ends in vCPU-Hours/GB-Hours). The rest are cheaper SKUs that would
+            # UNDER-project cost -- the dangerous direction for a budget guardian.
+            if "Fargate" not in usagetype:
+                continue
+            if any(x in usagetype for x in ("ARM", "Windows", "EphemeralStorage", "Spot")):
                 continue
             price = self._extract_price_from_response({"PriceList": [entry]})
+            # No real Fargate SKU is free, so a zero can only mean we picked the wrong product.
             if price is not None and price > 0:
                 return price
+
+        print(f"Fargate pricing: no Linux/x86 {usage_suffix} product matched; using fallback rate")
         return None
 
     def _calculate_hourly_cost(self, resources: dict[str, list[dict[str, Any]]]) -> Decimal:
@@ -925,14 +933,17 @@ class BudgetGuardian:
                     continue
 
                 cluster_id = db.get("cluster_id")
-                if str(db.get("engine", "")).startswith("aurora") and cluster_id:
-                    # AWS rejects StopDBInstance for Aurora: the whole cluster stops at once.
-                    if cluster_id in stopped_clusters:
-                        results["rds"].append({"id": db["id"], "status": "cluster_already_stopped"})
-                        continue
+                if cluster_id:
+                    # AWS rejects StopDBInstance for any cluster member -- both Aurora AND
+                    # RDS Multi-AZ DB clusters. The whole cluster must be stopped at once.
                     if not dry_run:
+                        if cluster_id in stopped_clusters:
+                            results["rds"].append(
+                                {"id": db["id"], "status": "cluster_already_stopped"}
+                            )
+                            continue
                         rds.stop_db_cluster(DBClusterIdentifier=cluster_id)
-                    stopped_clusters.add(cluster_id)
+                        stopped_clusters.add(cluster_id)
                 elif not dry_run:
                     rds.stop_db_instance(DBInstanceIdentifier=db["id"])
 
@@ -1130,16 +1141,18 @@ Remediation Executed:
 
         if status.action == "stop_all":
             stop_results = self.stop_all_resources(status.resources, dry_run=dry_run)
-            # Only send alert if at least one resource was actually changed (or would be in dry_run)
-            actually_changed = (
-                len([r for r in stop_results["ec2"] if r["status"] in ("stopped", "dry_run")])
-                + len([r for r in stop_results["rds"] if r["status"] in ("stopped", "dry_run")])
-                + len(
-                    [r for r in stop_results["lambda"] if r["status"] in ("throttled", "dry_run")]
-                )
-                + len([r for r in stop_results["ecs"] if r["status"] in ("scaled_down", "dry_run")])
+            # Alert whenever there was anything to act on — including resources we could NOT
+            # stop (skipped/error). A resource we failed to stop is still burning money, so
+            # staying silent about it is the worst possible outcome. Only genuinely
+            # no-op statuses are ignored, which preserves the original intent of not
+            # re-alerting on repeated runs over already-remediated resources.
+            NO_OP_STATUSES = {"already_throttled", "cluster_already_stopped"}
+            had_findings = any(
+                r["status"] not in NO_OP_STATUSES
+                for kind in ("ec2", "rds", "lambda", "ecs")
+                for r in stop_results[kind]
             )
-            if actually_changed > 0:
+            if had_findings:
                 alert_sent = self.send_alert(status, stop_results, dry_run=dry_run) is not None
 
         elif status.action == "alert":

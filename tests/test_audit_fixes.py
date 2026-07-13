@@ -325,6 +325,113 @@ class TestCloudWatchDatapointsSummed:
         assert cost == expected
 
 
+class TestAlertWhenNothingCouldBeStopped:
+    """The worst outcome is silence: budget blown, nothing could be shut down, and the
+    operator is never told. Previously the alert only fired if something actually CHANGED,
+    so a run consisting purely of skips/errors sent no email at all."""
+
+    @patch.object(BudgetGuardian, "_detect_lambda_spikes", return_value=[])
+    @patch.object(BudgetGuardian, "_calculate_hourly_cost", return_value=Decimal("50"))
+    @patch.object(BudgetGuardian, "_get_actual_spend", return_value=Decimal("5000"))
+    @patch.object(BudgetGuardian, "_discover_resources")
+    @patch("boto3.client")
+    def test_alert_is_sent_when_every_resource_was_skipped(
+        self, mock_boto, mock_discover, _spend, _hourly, _spikes
+    ):
+        clients = _mock_boto_factory(mock_boto)
+        sns = clients.setdefault("sns", MagicMock())
+        sns.publish.return_value = {"MessageId": "mid-1"}
+
+        # The account's only resource is a read replica, which AWS refuses to stop.
+        mock_discover.return_value = {
+            "ec2": [],
+            "lambda": [],
+            "ecs": [],
+            "rds": [
+                {
+                    "id": "replica-1",
+                    "class": "db.t3.medium",
+                    "engine": "postgres",
+                    "region": "us-east-1",
+                    "is_read_replica": True,
+                }
+            ],
+        }
+
+        guardian = BudgetGuardian(
+            regions=["us-east-1"],
+            total_budget=Decimal("100"),  # actual spend 5000 -> stop_all
+            sns_topic_arn="arn:aws:sns:us-east-1:123456789012:alerts",
+        )
+        result = guardian.run(dry_run=False)
+
+        assert result["status"].action == "stop_all"
+        assert result["alert_sent"] is True, "must alert even though nothing could be stopped"
+
+        body = sns.publish.call_args.kwargs["Message"]
+        assert "COULD NOT BE STOPPED" in body
+        assert "replica-1" in body
+
+
+class TestMultiAzDbClusterRemediation:
+    """N1: RDS Multi-AZ DB clusters (engine postgres/mysql, NOT Aurora) also have a
+    DBClusterIdentifier and also reject StopDBInstance. Dispatch must key on the cluster
+    id, not on the engine name."""
+
+    @patch("boto3.client")
+    def test_non_aurora_cluster_member_uses_stop_db_cluster(self, mock_boto):
+        clients = _mock_boto_factory(mock_boto)
+        rds = clients.setdefault("rds", MagicMock())
+
+        resources = {
+            "ec2": [],
+            "lambda": [],
+            "ecs": [],
+            "rds": [
+                {
+                    "id": "mysql-cluster-member",
+                    "class": "db.m6gd.large",
+                    "engine": "mysql",  # a Multi-AZ DB cluster, not Aurora
+                    "region": "us-east-1",
+                    "cluster_id": "my-multi-az-cluster",
+                }
+            ],
+        }
+
+        _guardian().stop_all_resources(resources, dry_run=False)
+
+        rds.stop_db_cluster.assert_called_once_with(DBClusterIdentifier="my-multi-az-cluster")
+        rds.stop_db_instance.assert_not_called()
+
+
+class TestFargateDetectionNegative:
+    """T2: guard the blast radius. A service on a CUSTOM (EC2 Auto Scaling) capacity
+    provider is not Fargate and must never be scaled down by the Fargate path."""
+
+    @patch("boto3.client")
+    def test_custom_capacity_provider_service_is_not_fargate(self, mock_boto):
+        clients = _mock_boto_factory(mock_boto)
+        _empty_paginated(clients, "ec2", "rds", "lambda")
+
+        ecs = clients.setdefault("ecs", MagicMock())
+        ecs.list_clusters.return_value = {"clusterArns": ["arn:aws:ecs:us-east-1:1:cluster/c"]}
+        ecs.list_services.return_value = {"serviceArns": ["arn:aws:ecs:us-east-1:1:service/c/s"]}
+        ecs.describe_services.return_value = {
+            "services": [
+                {
+                    "serviceName": "ec2-backed-svc",
+                    "serviceArn": "arn:aws:ecs:us-east-1:1:service/c/s",
+                    "runningCount": 3,
+                    # No launchType, and the capacity provider is a custom EC2 ASG one.
+                    "capacityProviderStrategy": [{"capacityProvider": "my-asg-provider"}],
+                    "taskDefinition": "arn:aws:ecs:us-east-1:1:task-definition/t:1",
+                }
+            ]
+        }
+
+        assert _guardian()._discover_resources()["ecs"] == []
+
+
 class TestFargatePricingSelection:
     """Audit #3: the Fargate query matched FOUR products (Linux/x86, ARM, Windows, and
     ECS-on-EC2 at $0.00) but took PriceList[0] with MaxResults=1, so it could silently
@@ -347,7 +454,10 @@ class TestFargatePricingSelection:
                         _price_entry("USE1-ECS-EC2-vCPU-Hours", "0.0000000000"),
                         _price_entry("USE1-Fargate-ARM-vCPU-Hours:perCPU", "0.03238"),
                         _price_entry("USE1-Fargate-Windows-vCPU-Hours:perCPU", "0.046552"),
-                        _price_entry("USE1-Fargate-vCPU-Hours:perCPU", "0.04048"),
+                        _price_entry("USE1-Fargate-Spot-vCPU-Hours:perCPU", "0.01234"),
+                        # Sentinel values chosen NOT to collide with the hardcoded fallback
+                        # rates, so this test cannot pass by silently falling back.
+                        _price_entry("USE1-Fargate-vCPU-Hours:perCPU", "0.07777"),
                     ]
                 }
             return {
@@ -355,7 +465,10 @@ class TestFargatePricingSelection:
                     _price_entry("USE1-ECS-EC2-GB-Hours", "0.0000000000"),
                     _price_entry("USE1-Fargate-ARM-GB-Hours", "0.00356"),
                     _price_entry("USE1-Fargate-Windows-GB-Hours", "0.00511175"),
-                    _price_entry("USE1-Fargate-GB-Hours", "0.004445"),
+                    # Ephemeral storage also ends in GB-Hours and is ~40x cheaper: picking it
+                    # would UNDER-project Fargate cost.
+                    _price_entry("USE1-Fargate-EphemeralStorage-GB-Hours", "0.000111"),
+                    _price_entry("USE1-Fargate-GB-Hours", "0.00888"),
                 ]
             }
 
@@ -363,5 +476,5 @@ class TestFargatePricingSelection:
 
         cpu_rate, memory_rate = _guardian()._get_fargate_unit_prices("us-east-1")
 
-        assert cpu_rate == Decimal("0.04048"), "must select the Linux/x86 Fargate vCPU rate"
-        assert memory_rate == Decimal("0.004445"), "must select the Linux/x86 Fargate GB rate"
+        assert cpu_rate == Decimal("0.07777"), "must select the Linux/x86 Fargate vCPU rate"
+        assert memory_rate == Decimal("0.00888"), "must select the Linux/x86 Fargate GB rate"
