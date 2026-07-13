@@ -86,14 +86,19 @@ def seed_rds(
         MasterUsername="admin",
         MasterUserPassword="Password123!",
     )
-    for _ in range(30):
+    deadline = time.time() + SEED_TIMEOUT_SECONDS
+    status = "unknown"
+    while time.time() < deadline:
         status = rds.describe_db_instances(DBInstanceIdentifier=identifier)["DBInstances"][0][
             "DBInstanceStatus"
         ]
         if status == "available":
-            break
-        time.sleep(1)
-    return identifier
+            return identifier
+        time.sleep(3)
+    raise TimeoutError(
+        f"RDS instance {identifier} never reached 'available' within {SEED_TIMEOUT_SECONDS}s "
+        f"(last seen status={status!r})"
+    )
 
 
 def seed_lambda(name: str, memory: int = 128, region: str = "us-east-1") -> str:
@@ -189,22 +194,22 @@ def teardown_all(region: str = "us-east-1") -> None:
         ]
         if ids:
             ec2.terminate_instances(InstanceIds=ids)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"teardown_all: EC2 cleanup failed (best-effort, continuing): {e}")
     rds = boto3.client("rds", region_name=region)
     try:
         for db in rds.describe_db_instances()["DBInstances"]:
             rds.delete_db_instance(
                 DBInstanceIdentifier=db["DBInstanceIdentifier"], SkipFinalSnapshot=True
             )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"teardown_all: RDS cleanup failed (best-effort, continuing): {e}")
     lam = boto3.client("lambda", region_name=region)
     try:
         for fn in lam.list_functions()["Functions"]:
             lam.delete_function(FunctionName=fn["FunctionName"])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"teardown_all: Lambda cleanup failed (best-effort, continuing): {e}")
     ecs = boto3.client("ecs", region_name=region)
     try:
         for c in ecs.list_clusters()["clusterArns"]:
@@ -212,5 +217,5 @@ def teardown_all(region: str = "us-east-1") -> None:
                 ecs.update_service(cluster=c, service=s, desiredCount=0)
                 ecs.delete_service(cluster=c, service=s, force=True)
             ecs.delete_cluster(cluster=c)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"teardown_all: ECS cleanup failed (best-effort, continuing): {e}")
