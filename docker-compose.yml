@@ -1,0 +1,15 @@
+services:
+  floci:
+    image: floci/floci:latest
+    ports:
+      - "4566:4566"
+    volumes:
+      # MANDATORY: Floci runs EC2/RDS/ECS as real Docker containers via its own
+      # Docker engine. Without this socket, EC2 instances terminate instantly,
+      # ECS tasks never start, and RDS create_db_instance returns invalid XML.
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
