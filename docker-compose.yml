@@ -1,6 +1,9 @@
 services:
   floci:
-    image: floci/floci:latest
+    # Pinned by digest, not `:latest` — a mutable tag combined with the
+    # docker.sock mount below is a supply-chain risk (root-equivalent access
+    # to the Docker daemon). Re-pin deliberately when upgrading.
+    image: floci/floci@sha256:4f69631e560120d79ad82d2af9f7dda8c6ef7ecbbae0c43ddcffa109c6588a15
     ports:
       - "4566:4566"
     volumes:

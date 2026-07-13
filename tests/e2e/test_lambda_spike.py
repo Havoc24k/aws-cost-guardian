@@ -20,3 +20,4 @@ def test_spike_detected_from_cloudwatch_metrics(clean_account):
     status = guardian.check_budget()
 
     assert any(s.function_name == "e2e-spiky-fn" for s in status.lambda_spikes)
+    assert status.action == "spike_alert"

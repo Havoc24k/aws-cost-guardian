@@ -75,8 +75,8 @@ Without Floci running, `uv run pytest` skips the e2e suite automatically — no 
 for everyday development.
 
 Notes:
-- **Slow.** Floci launches real Docker containers for EC2/RDS/ECS, and seed helpers poll for
-  up to 180s for resources to become genuinely available. Expect the e2e job to take minutes,
+- **Slow.** Floci launches real Docker containers for EC2/RDS/ECS/Lambda, and seed helpers poll
+  for up to 180s for resources to become genuinely available. Expect the e2e job to take minutes,
   not seconds.
 - **Pricing is not validated.** Floci's Pricing API doesn't implement `TERM_MATCH` filtering, so
   every resource price falls back to the hardcoded `DEFAULT_*` constants. The e2e layer proves the
@@ -107,6 +107,8 @@ src/                  # Lambda code
   lambda_handler.py
 cli.py                # Local CLI for testing
 docs/                 # Documentation
+tests/                # Unit tests + e2e (Floci) suite
+docker-compose.yml    # Floci emulator for e2e tests
 ```
 
 ## Development
@@ -115,7 +117,7 @@ docs/                 # Documentation
 # Install with dev dependencies
 uv sync --all-extras
 
-# Run linters
-uv run ruff check src/*.py cli.py
-uv run ruff format src/*.py cli.py
+# Run linters (matches CI, which lints the whole repo including tests/e2e/)
+uv run ruff check .
+uv run ruff format .
 ```

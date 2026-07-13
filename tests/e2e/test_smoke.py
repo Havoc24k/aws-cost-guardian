@@ -9,7 +9,9 @@ pytestmark = pytest.mark.e2e
 def test_sts_reaches_floci():
     sts = boto3.client("sts", region_name="us-east-1")
     identity = sts.get_caller_identity()
-    assert "Account" in identity
+    assert identity["Account"] == "000000000000", (
+        "Expected Floci's dummy account — refusing to run destructive e2e tests against real AWS"
+    )
 
 
 def test_cost_explorer_responds():
