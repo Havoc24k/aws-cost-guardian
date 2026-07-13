@@ -91,7 +91,30 @@ resource "aws_iam_role_policy" "lambda" {
         Effect = "Allow"
         Action = [
           "rds:DescribeDBInstances",
-          "rds:StopDBInstance"
+          "rds:StopDBInstance",
+          # Aurora members cannot be stopped individually; the cluster must be stopped.
+          "rds:StopDBCluster"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECS"
+        Effect = "Allow"
+        Action = [
+          "ecs:ListClusters",
+          "ecs:ListServices",
+          "ecs:DescribeServices",
+          "ecs:DescribeTaskDefinition",
+          "ecs:UpdateService"
+        ]
+        Resource = "*"
+      },
+      {
+        # Public SSM parameters map a region code to the Pricing API location name.
+        Sid    = "SSMRegionLookup"
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter"
         ]
         Resource = "*"
       },
