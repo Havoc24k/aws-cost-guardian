@@ -29,6 +29,11 @@ ignore = ["E501"]
 [tool.ruff.format]
 quote-style = "double"
 
+[tool.pytest.ini_options]
+markers = [
+    "e2e: end-to-end tests that require a running Floci instance on localhost:4566",
+]
+
 [tool.mypy]
 python_version = "3.11"
 warn_return_any = true

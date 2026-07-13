@@ -1,0 +1,18 @@
+services:
+  floci:
+    # Pinned by digest, not `:latest` — a mutable tag combined with the
+    # docker.sock mount below is a supply-chain risk (root-equivalent access
+    # to the Docker daemon). Re-pin deliberately when upgrading.
+    image: floci/floci@sha256:4f69631e560120d79ad82d2af9f7dda8c6ef7ecbbae0c43ddcffa109c6588a15
+    ports:
+      - "4566:4566"
+    volumes:
+      # MANDATORY: Floci runs EC2/RDS/ECS as real Docker containers via its own
+      # Docker engine. Without this socket, EC2 instances terminate instantly,
+      # ECS tasks never start, and RDS create_db_instance returns invalid XML.
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

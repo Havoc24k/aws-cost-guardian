@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src/ cli.py
+      - run: uv run pytest -m "not e2e"
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      # CI hygiene: tear down any leftover containers from a previous run first.
+      # Orphaned Floci containers can squat host ports (e.g. 4566) and cause
+      # spurious "EC2 seed died" failures further down the pipeline.
+      - name: Tear down any leftover containers
+        run: docker compose down -v --remove-orphans
+      - name: Start Floci
+        run: docker compose up -d floci
+      - name: Wait for Floci to be healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4566/ >/dev/null; then
+              echo "Floci is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Floci did not become ready in time" >&2
+          docker compose logs floci
+          exit 1
+      - run: uv run pytest -m e2e -v

@@ -59,7 +59,6 @@ def cmd_status(args):
     print(f"EC2 Instances:         {len(status.resources['ec2'])}")
     print(f"RDS Instances:         {len(status.resources['rds'])}")
     print(f"Lambda Functions:      {len(status.resources['lambda'])}")
-    print(f"App Runner Services:   {len(status.resources['apprunner'])}")
     print(f"ECS Fargate Services:  {len(status.resources['ecs'])}")
     print()
     print(f"Action: {_format_action(status)}")
@@ -94,10 +93,6 @@ def cmd_status(args):
             print("Lambda:")
             for r in status.resources["lambda"]:
                 print(f"  - {r['name']} ({r['memory_mb']}MB) in {r['region']}")
-        if status.resources["apprunner"]:
-            print("App Runner:")
-            for r in status.resources["apprunner"]:
-                print(f"  - {r['name']} in {r['region']}")
         if status.resources["ecs"]:
             print("ECS Fargate:")
             for r in status.resources["ecs"]:
@@ -132,7 +127,6 @@ def cmd_test(args):
         print(f"  EC2: {len(status.resources['ec2'])} instances")
         print(f"  RDS: {len(status.resources['rds'])} instances")
         print(f"  Lambda: {len(status.resources['lambda'])} functions")
-        print(f"  App Runner: {len(status.resources['apprunner'])} services")
         print(f"  ECS Fargate: {len(status.resources['ecs'])} services")
 
     return 0
@@ -141,7 +135,7 @@ def cmd_test(args):
 def cmd_stop(args):
     """Stop all resources (use with caution)."""
     if not args.confirm:
-        print("This will stop ALL EC2, RDS, App Runner, ECS, and throttle ALL Lambda functions!")
+        print("This will stop ALL EC2, RDS, ECS, and throttle ALL Lambda functions!")
         print("Use --confirm to proceed.")
         return 1
 
@@ -152,8 +146,7 @@ def cmd_stop(args):
 
     print(
         f"Found: {len(status.resources['ec2'])} EC2, {len(status.resources['rds'])} RDS, "
-        f"{len(status.resources['lambda'])} Lambda, {len(status.resources['apprunner'])} App Runner, "
-        f"{len(status.resources['ecs'])} ECS"
+        f"{len(status.resources['lambda'])} Lambda, {len(status.resources['ecs'])} ECS"
     )
 
     if args.dry_run:
@@ -169,9 +162,6 @@ def cmd_stop(args):
     print(f"  RDS stopped: {len([r for r in results['rds'] if r['status'] == 'stopped'])}")
     print(
         f"  Lambda throttled: {len([r for r in results['lambda'] if r['status'] == 'throttled'])}"
-    )
-    print(
-        f"  App Runner paused: {len([r for r in results['apprunner'] if r['status'] == 'paused'])}"
     )
     print(f"  ECS scaled down: {len([r for r in results['ecs'] if r['status'] == 'scaled_down'])}")
 
