@@ -19,6 +19,34 @@
 - E2E tests carry `@pytest.mark.e2e` and auto-skip when `localhost:4566` is unreachable.
 - After App Runner removal, the resource dicts have exactly these keys: `ec2`, `rds`, `lambda`, `ecs`.
 
+## Verified Floci Behavior (Phase 0 spike — COMPLETE, empirically confirmed 2026-07-13)
+
+These are measured facts, not assumptions. Do not deviate from them.
+
+- **Image is `floci/floci:latest`** (Docker Hub). `ghcr.io/floci-io/floci:latest` does NOT exist.
+- **Mounting `/var/run/docker.sock` is MANDATORY.** Floci runs EC2/RDS/ECS as real Docker
+  containers via its own Docker engine. Without the socket, EC2 instances go straight to
+  `terminated`, ECS tasks never start, and RDS `create_db_instance` fails with an XML parse error.
+- **`AWS_ENDPOINT_URL` routing works** — confirmed `sts.get_caller_identity()` → account `000000000000`.
+- **EC2 needs a real Floci AMI**: use `ami-0abcdef1234567890` (amzn2). A made-up AMI id is rejected.
+  Instances take time to reach `running` — **poll, don't assume**.
+- **ECS Fargate takes ~40s** for `runningCount` to go from 0 → 1. The guardian only discovers
+  services with `runningCount > 0`, so seeds **must poll** until then. `launchType` IS correctly
+  reported as `'FARGATE'`.
+- **RDS works** and reports `available` quickly.
+- **Pricing API supports `AmazonEC2` ONLY.** `AmazonRDS` and `AmazonECS` raise
+  `InvalidParameterException: Invalid ServiceCode`, so RDS and Fargate costs always fall back to
+  `DEFAULT_RDS_HOURLY` / `DEFAULT_ECS_FARGATE_HOURLY`. Never assert that RDS/Fargate pricing came
+  from the API.
+- **Cost Explorer synthesizes ≈ $0** month-to-date spend. The `actual_exceeded` test must tolerate
+  this (it skips when `actual_spend == 0`).
+- **SSM `/aws/service/global-infrastructure/.../longName` is NOT present** → `_region_to_location()`
+  falls back to "US East (N. Virginia)". Harmless for `us-east-1` tests.
+- **Verified end-to-end:** with EC2 + RDS + ECS seeded, `check_budget()` returned
+  `hourly_cost=$0.2623425`, `action=ok`, discovering `ec2=1 rds=1 ecs=1`. Lambda throttle
+  remediation returned `status='throttled'`.
+- **Consequence for test timing:** e2e seeds are slow (~40–60s). Do not add short timeouts.
+
 ---
 
 ### Task 1: Remove App Runner support
@@ -125,17 +153,23 @@ git commit -m "Remove App Runner support (deprecated, untestable on Floci, crash
 ```yaml
 services:
   floci:
-    image: ghcr.io/floci-io/floci:latest
+    image: floci/floci:latest
     ports:
       - "4566:4566"
+    volumes:
+      # MANDATORY: Floci runs EC2/RDS/ECS as real Docker containers via its own
+      # Docker engine. Without this socket, EC2 instances terminate instantly,
+      # ECS tasks never start, and RDS create_db_instance returns invalid XML.
+      - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/_floci/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:4566/"]
       interval: 5s
       timeout: 3s
       retries: 20
 ```
 
-> NOTE: confirm the image tag and healthcheck path against the Floci README during Step 4 (the smoke run). If `/_floci/health` 404s, fall back to `http://localhost:4566/` and adjust.
+> These values are VERIFIED (see "Verified Floci Behavior" above), not guesses. Do not change the
+> image name or drop the docker.sock volume.
 
 - [ ] **Step 2: Register the `e2e` marker in `pyproject.toml`**
 
@@ -231,12 +265,38 @@ def _lambda_zip() -> bytes:
     return buf.getvalue()
 
 
+# VERIFIED: a real AMI that Floci ships. A made-up AMI id makes the instance terminate instantly.
+FLOCI_AMI = "ami-0abcdef1234567890"
+
+# Floci starts real Docker containers, so resources are NOT instantly available.
+SEED_TIMEOUT_SECONDS = 180
+
+
 def seed_ec2(count: int = 1, instance_type: str = "t3.medium", region: str = "us-east-1") -> list[str]:
+    """Launch EC2 instances and WAIT until they are 'running'.
+
+    The guardian only discovers instances in the 'running' state, so returning before
+    they get there would make discovery find nothing.
+    """
     ec2 = boto3.client("ec2", region_name=region)
     resp = ec2.run_instances(
-        ImageId="ami-12345678", MinCount=count, MaxCount=count, InstanceType=instance_type
+        ImageId=FLOCI_AMI, MinCount=count, MaxCount=count, InstanceType=instance_type
     )
-    return [i["InstanceId"] for i in resp["Instances"]]
+    ids = [i["InstanceId"] for i in resp["Instances"]]
+
+    deadline = time.time() + SEED_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        states = [
+            i["State"]["Name"]
+            for r in ec2.describe_instances(InstanceIds=ids)["Reservations"]
+            for i in r["Instances"]
+        ]
+        if all(s == "running" for s in states):
+            return ids
+        if any(s in ("terminated", "shutting-down") for s in states):
+            raise RuntimeError(f"EC2 seed died (states={states}) — is /var/run/docker.sock mounted?")
+        time.sleep(3)
+    raise TimeoutError(f"EC2 instances {ids} never reached 'running' within {SEED_TIMEOUT_SECONDS}s")
 
 
 def seed_rds(
@@ -304,7 +364,19 @@ def seed_ecs_fargate(cluster: str, service: str, region: str = "us-east-1") -> d
             "awsvpcConfiguration": {"subnets": ["subnet-12345678"], "assignPublicIp": "ENABLED"}
         },
     )
-    return {"cluster": cluster, "service": service, "task_definition": td_arn}
+
+    # VERIFIED: Floci takes ~40s to actually start the Fargate task. The guardian only
+    # discovers services with runningCount > 0, so we must wait for it.
+    deadline = time.time() + SEED_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        desc = ecs.describe_services(cluster=cluster, services=[service])["services"][0]
+        if desc.get("runningCount", 0) > 0:
+            return {"cluster": cluster, "service": service, "task_definition": td_arn}
+        time.sleep(3)
+    raise TimeoutError(
+        f"ECS service {service} never reached runningCount>0 within {SEED_TIMEOUT_SECONDS}s "
+        "— is /var/run/docker.sock mounted?"
+    )
 
 
 def seed_lambda_spike_metrics(function_name: str, region: str = "us-east-1") -> None:
